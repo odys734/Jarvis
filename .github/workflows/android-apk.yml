@@ -1,10 +1,8 @@
 name: Jarvis Android APK
 
 on:
+  # Build only when explicitly requested; source commits do not start builds.
   workflow_dispatch:
-  push:
-    branches:
-      - master
 
 permissions:
   contents: read
