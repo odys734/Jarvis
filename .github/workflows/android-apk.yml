@@ -1,0 +1,62 @@
+name: Jarvis Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.2.1'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.9'
+          channel: stable
+          cache: true
+
+      - name: Generate Android Gradle Wrapper
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/gradle-wrapper"
+          cd "$RUNNER_TEMP/gradle-wrapper"
+          touch settings.gradle.kts build.gradle.kts
+          gradle wrapper --gradle-version 9.2.1
+          cp gradlew gradlew.bat "$GITHUB_WORKSPACE/android/"
+          mkdir -p "$GITHUB_WORKSPACE/android/gradle"
+          cp -R gradle/wrapper "$GITHUB_WORKSPACE/android/gradle/"
+          chmod +x "$GITHUB_WORKSPACE/android/gradlew"
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Build Debug APK
+        run: flutter build apk --debug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Jarvis-debug-APK
+          path: build/app/outputs/flutter-apk/app-debug.apk
+          if-no-files-found: error

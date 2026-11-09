@@ -56,11 +56,19 @@ class _CodeBlackScreenState extends State<CodeBlackScreen>
 
   void _listenForVoiceOverride() {
     VoiceService.instance.onListeningChanged = (listening) {
-      if (!listening && mounted && _service.isArmed) {
+      if (!listening &&
+          VoiceService.instance.lastError == null &&
+          !VoiceService.instance.isSpeaking.value &&
+          mounted &&
+          _service.isArmed) {
         Future.delayed(const Duration(milliseconds: 400), () {
-          if (mounted && _service.isArmed) {
+          if (mounted &&
+              _service.isArmed &&
+              !VoiceService.instance.isSpeaking.value &&
+              VoiceService.instance.lastError == null) {
             unawaited(VoiceService.instance.startListening(
               continuous: true,
+              owner: this,
               onResult: (words, isFinal, candidates) {
                 if (_service.checkVoiceDisarm(words)) {
                   if (mounted) Navigator.of(context).pop();
@@ -74,6 +82,7 @@ class _CodeBlackScreenState extends State<CodeBlackScreen>
 
     unawaited(VoiceService.instance.startListening(
       continuous: true,
+      owner: this,
       onResult: (words, isFinal, candidates) {
         if (_service.checkVoiceDisarm(words)) {
           if (mounted) Navigator.of(context).pop();
@@ -84,8 +93,11 @@ class _CodeBlackScreenState extends State<CodeBlackScreen>
 
   @override
   void dispose() {
-    VoiceService.instance.onSpeechResult = null;
+    VoiceService.instance.releaseResultHandler(this);
     VoiceService.instance.onListeningChanged = null;
+    if (!VoiceService.instance.hasContinuousListeners) {
+      unawaited(VoiceService.instance.stopListening());
+    }
     _glitchController.dispose();
     _flickerTimer?.cancel();
     super.dispose();

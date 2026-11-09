@@ -23,18 +23,34 @@ class VoiceService {
   bool _speechReady = false;
   bool _ttsReady = false;
   bool _listening = false;
+  bool _nativeReady = false;
   Completer<void>? _speakCompleter;
+  Completer<bool>? _startCompleter;
+  String? _lastError;
+
+  final Map<Object, void Function(String, bool, List<String>)> _continuousHandlers =
+      <Object, void Function(String, bool, List<String>)>{};
+  final Map<Object, void Function(String, bool, List<String>)> _manualHandlers =
+      <Object, void Function(String, bool, List<String>)>{};
+  void Function(String, bool, List<String>)? _legacyContinuousHandler;
+  void Function(String, bool, List<String>)? _legacyManualHandler;
+  bool _manualSessionActive = false;
 
   final ValueNotifier<bool> isSpeaking = ValueNotifier<bool>(false);
   final ValueNotifier<double> soundLevel = ValueNotifier<double>(0.0);
   final ValueNotifier<bool> listeningNotifier = ValueNotifier<bool>(false);
+  final ValueNotifier<bool> manualSessionActive = ValueNotifier<bool>(false);
 
   void Function(bool isListening)? onListeningChanged;
   void Function(String status)? onSpeechStatus;
+  void Function(String message)? onSpeechError;
   void Function(String words, bool isFinal, List<String> candidates)? onSpeechResult;
 
   bool get isListening => _listening;
   bool get isAvailable => _speechReady;
+  String? get lastError => _lastError;
+  bool get hasContinuousListeners =>
+      _continuousHandlers.isNotEmpty || _legacyContinuousHandler != null;
 
   void _initNativeSpeechChannel() {
     _nativeSpeechChannel.setMethodCallHandler((call) async {
@@ -43,26 +59,79 @@ class VoiceService {
           final args = call.arguments as Map?;
           final text = (args?['text'] ?? '').toString();
           final isFinal = args?['isFinal'] == true;
+          if (isFinal) _nativeReady = false;
           final candidates = (args?['candidates'] as List?)
                   ?.map((e) => e.toString())
                   .toList() ??
               (text.isNotEmpty ? [text] : <String>[]);
           if (text.isNotEmpty || candidates.isNotEmpty) {
-            onSpeechResult?.call(text, isFinal, candidates);
+            _dispatchSpeechResult(text, isFinal, candidates);
           }
           break;
         case 'onSpeechStatus':
           final status = call.arguments.toString();
           onSpeechStatus?.call(status);
-          if (status == 'listening') {
-            _listening = true;
-            listeningNotifier.value = true;
-            onListeningChanged?.call(true);
-          } else if (status == 'notListening') {
-            _listening = false;
-            listeningNotifier.value = false;
-            onListeningChanged?.call(false);
+          switch (status) {
+            case 'listening':
+              _lastError = null;
+              _nativeReady = true;
+              _setListening(true);
+              _completeStart(true);
+              break;
+            case 'starting':
+              _lastError = null;
+              _nativeReady = false;
+              break;
+            case 'endOfSpeech':
+              _nativeReady = false;
+              break;
+            case 'manualEnded':
+              _nativeReady = false;
+              _endManualSession();
+              _setListening(false);
+              _completeStart(false);
+              break;
+            case 'notListening':
+              _nativeReady = false;
+              _setListening(false);
+              _endManualSession();
+              _completeStart(false);
+              break;
+            case 'mediaActive':
+              _lastError = 'Microphone is paused while media is playing';
+              _nativeReady = false;
+              _setListening(false);
+              _endManualSession();
+              _completeStart(false);
+              break;
+            case 'unavailable':
+              _speechReady = false;
+              _nativeReady = false;
+              _lastError = 'Speech recognition is unavailable on this device';
+              _setListening(false);
+              _endManualSession();
+              _completeStart(false);
+              break;
+            case 'permissionDenied':
+              _nativeReady = false;
+              _lastError = 'Microphone permission is required';
+              _setListening(false);
+              _endManualSession();
+              _completeStart(false);
+              break;
+            default:
+              if (status.startsWith('error:')) _nativeReady = false;
+              break;
           }
+          break;
+        case 'onSpeechError':
+          final args = call.arguments as Map?;
+          final message =
+              (args?['message'] ?? 'Speech recognition failed').toString();
+          _nativeReady = false;
+          _lastError = message;
+          onSpeechError?.call(message);
+          _completeStart(false);
           break;
         case 'onSoundLevel':
           final level = (call.arguments as num?)?.toDouble() ?? 0.0;
@@ -74,23 +143,34 @@ class VoiceService {
 
   Future<bool> _ensureMicPermission() async {
     try {
-      final status = await Permission.microphone.request();
+      var status = await Permission.microphone.status;
+      if (!status.isGranted) {
+        status = await Permission.microphone.request();
+      }
       return status.isGranted;
-    } catch (_) {
-      // Gracefully allow mock/headless testing environments where permission channel is unmocked
-      return true;
+    } catch (e) {
+      debugPrint('[VoiceService] Microphone permission error: $e');
+      return false;
     }
   }
 
   Future<bool> initSpeech() async {
     if (_speechReady) return true;
-    if (!await _ensureMicPermission()) return false;
+    if (!await _ensureMicPermission()) {
+      _lastError = 'Microphone permission is required';
+      return false;
+    }
     try {
       final available =
-          await _nativeSpeechChannel.invokeMethod<bool>('isAvailable') ?? true;
+          await _nativeSpeechChannel.invokeMethod<bool>('isAvailable') ?? false;
       _speechReady = available;
-    } catch (_) {
-      _speechReady = true;
+      if (!available) {
+        _lastError = 'Speech recognition is unavailable on this device';
+      }
+    } catch (e) {
+      debugPrint('[VoiceService] Speech availability check failed: $e');
+      _speechReady = false;
+      _lastError = 'Speech recognition is unavailable on this device';
     }
     return _speechReady;
   }
@@ -193,34 +273,195 @@ class VoiceService {
     await initTts(voiceProfile: profile);
   }
 
-  /// Starts native continuous speech recognition.
+  void _setListening(bool value) {
+    if (_listening == value && listeningNotifier.value == value) return;
+    _listening = value;
+    listeningNotifier.value = value;
+    onListeningChanged?.call(value);
+  }
+
+  void _completeStart(bool value) {
+    final completer = _startCompleter;
+    if (completer != null && !completer.isCompleted) {
+      completer.complete(value);
+    }
+  }
+
+  void _registerResultHandler({
+    required bool continuous,
+    required Object? owner,
+    required void Function(String, bool, List<String>) handler,
+  }) {
+    if (continuous) {
+      if (owner != null) {
+        _continuousHandlers[owner] = handler;
+      } else {
+        _legacyContinuousHandler = handler;
+        onSpeechResult = handler;
+      }
+    } else {
+      if (owner != null) {
+        _manualHandlers[owner] = handler;
+      } else {
+        _legacyManualHandler = handler;
+        onSpeechResult = handler;
+      }
+      _setManualSessionActive(true);
+    }
+  }
+
+  void _setManualSessionActive(bool value) {
+    _manualSessionActive = value;
+    if (manualSessionActive.value != value) {
+      manualSessionActive.value = value;
+    }
+  }
+
+  void _endManualSession() {
+    final legacyManual = _legacyManualHandler;
+    _setManualSessionActive(false);
+    _manualHandlers.clear();
+    _legacyManualHandler = null;
+    if (legacyManual != null && identical(onSpeechResult, legacyManual)) {
+      onSpeechResult = _legacyContinuousHandler;
+    }
+  }
+
+  void _dispatchSpeechResult(
+    String text,
+    bool isFinal,
+    List<String> candidates,
+  ) {
+    final handlers = <void Function(String, bool, List<String>)>{};
+    if (_manualSessionActive) {
+      handlers.addAll(_manualHandlers.values);
+      final legacy = _legacyManualHandler;
+      if (legacy != null) handlers.add(legacy);
+    } else {
+      handlers.addAll(_continuousHandlers.values);
+      final legacy = _legacyContinuousHandler;
+      if (legacy != null) handlers.add(legacy);
+      final fieldHandler = onSpeechResult;
+      if (fieldHandler != null) handlers.add(fieldHandler);
+    }
+    for (final handler in handlers) {
+      try {
+        handler(text, isFinal, candidates);
+      } catch (e) {
+        debugPrint('[VoiceService] Speech result handler failed: $e');
+      }
+    }
+  }
+
+  /// Removes a screen's speech handlers without touching global callbacks.
+  void releaseResultHandler(Object owner) {
+    _continuousHandlers.remove(owner);
+    _manualHandlers.remove(owner);
+  }
+
+  String _messageForStartReason(String? reason) {
+    switch (reason) {
+      case 'mediaActive':
+        return 'Microphone is paused while media is playing';
+      case 'unavailable':
+        return 'Speech recognition is unavailable on this device';
+      case 'permissionDenied':
+        return 'Microphone permission is required';
+      default:
+        return 'Speech recognition could not start';
+    }
+  }
+
+  /// Starts native speech recognition and only succeeds once the engine
+  /// confirms it is actually listening.
   /// [onResult] receives primary recognized words, isFinal, and N-best candidates.
   Future<bool> startListening({
     required void Function(String words, bool isFinal, List<String> candidates) onResult,
     bool continuous = true,
     bool manual = false,
+    Object? owner,
+    String? language,
   }) async {
     if (!await initSpeech()) return false;
-    onSpeechResult = onResult;
-    if (_listening && continuous && !manual) {
-      // Already running continuous listening loop
+
+    // An explicit manual capture owns the microphone until it finishes. Do
+    // not let a background continuous restart silently replace its handler.
+    if (!manual && _manualSessionActive) return false;
+
+    if (continuous) {
+      _endManualSession();
+    }
+    _registerResultHandler(
+      continuous: continuous,
+      owner: owner,
+      handler: onResult,
+    );
+
+    if (_listening && _nativeReady && continuous && !manual && !_manualSessionActive) {
       return true;
     }
+
+    _completeStart(false);
+    final completer = Completer<bool>();
+    _startCompleter = completer;
+
     try {
-      await _nativeSpeechChannel.invokeMethod('startListening', {
-        'continuous': continuous,
-        'manual': manual,
-      });
-      _listening = true;
-      listeningNotifier.value = true;
-      onListeningChanged?.call(true);
-      return true;
+      final raw = await _nativeSpeechChannel.invokeMethod<dynamic>(
+        'startListening',
+        <String, dynamic>{
+          'continuous': continuous,
+          'manual': manual,
+          if (language != null && language.isNotEmpty) 'language': language,
+        },
+      );
+      final response = raw is Map ? raw : const <Object?, Object?>{};
+      final accepted = response['accepted'] != false;
+      final deferred = response['deferred'] == true;
+      final alreadyListening = response['alreadyListening'] == true;
+      final reason = response['reason']?.toString();
+
+      if (!accepted || deferred) {
+        _nativeReady = false;
+        _lastError = _messageForStartReason(reason);
+        if (manual) _endManualSession();
+        _completeStart(false);
+        _startCompleter = null;
+        return false;
+      }
+
+      if (alreadyListening) {
+        _lastError = null;
+        _nativeReady = true;
+        _setListening(true);
+        _completeStart(true);
+        _startCompleter = null;
+        return true;
+      }
+
+      final ready = await completer.future.timeout(
+        const Duration(seconds: 7),
+        onTimeout: () {
+          _lastError = 'Speech engine did not become ready';
+          return false;
+        },
+      );
+      if (!ready) {
+        _nativeReady = false;
+        debugPrint('[VoiceService] startListening not ready: $_lastError');
+      }
+      return ready;
     } catch (e) {
       debugPrint('[VoiceService] startListening error: $e');
-      _listening = false;
-      listeningNotifier.value = false;
-      onListeningChanged?.call(false);
+      _nativeReady = false;
+      _lastError = 'Speech recognition could not start';
+      if (manual) _endManualSession();
+      _setListening(false);
+      _completeStart(false);
       return false;
+    } finally {
+      if (identical(_startCompleter, completer)) {
+        _startCompleter = null;
+      }
     }
   }
 
@@ -236,9 +477,10 @@ class VoiceService {
 
   /// Stops speech recognition immediately.
   Future<void> stopListening() async {
-    _listening = false;
-    listeningNotifier.value = false;
-    onListeningChanged?.call(false);
+    _endManualSession();
+    _nativeReady = false;
+    _setListening(false);
+    _completeStart(false);
     try {
       await _nativeSpeechChannel.invokeMethod('stopListening');
     } catch (_) {}

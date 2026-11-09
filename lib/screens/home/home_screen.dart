@@ -85,6 +85,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    _voice.releaseResultHandler(this);
     _voice.listeningNotifier.removeListener(_onVoiceListeningChanged);
     ProactiveAgentService.instance.removeListener(_onProactiveUpdate);
     JarvisService.instance.onWakeWordTriggered = null;
@@ -156,6 +157,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
     final started = await _voice.startListening(
       continuous: false,
+      manual: true,
+      owner: this,
       onResult: (words, isFinal, candidates) {
         if (!mounted) return;
         setState(() {
@@ -164,11 +167,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         });
       },
     );
-    if (!started && mounted) {
+    if (!mounted) return;
+    if (!started) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
+        SnackBar(
           content: Text(
-            'Speech recognition unavailable — check microphone permission.',
+            _voice.lastError ??
+                'Speech recognition unavailable — check microphone permission.',
           ),
         ),
       );

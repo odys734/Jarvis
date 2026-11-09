@@ -432,22 +432,37 @@ class AgentAccessibilityService : AccessibilityService() {
                 override fun onSuccess(screenshotResult: ScreenshotResult) {
                     try {
                         val hwBuffer = screenshotResult.hardwareBuffer
-                        val hwBitmap =
+                        val hwBitmap = try {
                             Bitmap.wrapHardwareBuffer(hwBuffer, screenshotResult.colorSpace)
-                        hwBuffer.close()
+                        } finally {
+                            hwBuffer.close()
+                        }
                         if (hwBitmap == null) {
                             mainHandler.post {
                                 result.error("FAILED", "wrapHardwareBuffer returned null", null)
                             }
                             return
                         }
-                        val soft = hwBitmap.copy(Bitmap.Config.ARGB_8888, false)
-                        hwBitmap.recycle()
+                        val soft = try {
+                            hwBitmap.copy(Bitmap.Config.ARGB_8888, false)
+                        } finally {
+                            hwBitmap.recycle()
+                        }
+                        if (soft == null) {
+                            mainHandler.post {
+                                result.error("FAILED", "Bitmap copy returned null", null)
+                            }
+                            return
+                        }
                         val stream = ByteArrayOutputStream()
-                        soft.compress(Bitmap.CompressFormat.PNG, 85, stream)
-                        soft.recycle()
-                        val b64 = Base64.encodeToString(stream.toByteArray(), Base64.NO_WRAP)
-                        mainHandler.post { result.success(b64) }
+                        try {
+                            soft.compress(Bitmap.CompressFormat.PNG, 85, stream)
+                            val b64 = Base64.encodeToString(stream.toByteArray(), Base64.NO_WRAP)
+                            mainHandler.post { result.success(b64) }
+                        } finally {
+                            soft.recycle()
+                            try { stream.close() } catch (_: Exception) {}
+                        }
                     } catch (e: Exception) {
                         mainHandler.post { result.error("FAILED", e.message, null) }
                     }

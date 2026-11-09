@@ -18,18 +18,37 @@ class _PolyglotDiplomatDialogState extends State<PolyglotDiplomatDialog> {
   bool _isListening = false;
 
   @override
+  void initState() {
+    super.initState();
+    VoiceService.instance.manualSessionActive.addListener(_onManualSessionChanged);
+  }
+
+  void _onManualSessionChanged() {
+    if (!mounted || VoiceService.instance.manualSessionActive.value) return;
+    if (_isListening) {
+      setState(() => _isListening = false);
+    }
+  }
+
+  @override
   void dispose() {
+    VoiceService.instance.manualSessionActive.removeListener(
+          _onManualSessionChanged,
+        );
+    VoiceService.instance.releaseResultHandler(this);
     _textController.dispose();
     super.dispose();
   }
 
-  void _startVoiceTranslation() {
+  Future<void> _startVoiceTranslation() async {
     setState(() => _isListening = true);
     HapticFeedback.mediumImpact();
 
-    VoiceService.instance.startListening(
+    final started = await VoiceService.instance.startListening(
       manual: true,
+      owner: this,
       onResult: (text, isFinal, candidates) async {
+        if (!mounted) return;
         setState(() => _isListening = false);
         if (text.trim().isNotEmpty) {
           _textController.text = text;
@@ -37,6 +56,15 @@ class _PolyglotDiplomatDialogState extends State<PolyglotDiplomatDialog> {
         }
       },
     );
+    if (!started && mounted) {
+      setState(() => _isListening = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(VoiceService.instance.lastError ??
+              'Microphone could not start'),
+        ),
+      );
+    }
   }
 
   @override

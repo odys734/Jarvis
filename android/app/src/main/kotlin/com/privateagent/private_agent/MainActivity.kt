@@ -1,11 +1,13 @@
 package com.privateagent.private_agent
 
+import android.Manifest
 import android.app.ActivityManager
 import android.app.AppOpsManager
 import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -14,6 +16,7 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.media.AudioManager
+import android.media.AudioPlaybackConfiguration
 import android.net.Uri
 import android.os.BatteryManager
 import android.os.Build
@@ -23,6 +26,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.Process
 import android.os.StatFs
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.provider.Settings
 import android.speech.RecognitionListener
@@ -35,6 +39,7 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.util.Calendar
+import java.util.Locale
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
@@ -52,7 +57,22 @@ class MainActivity : FlutterActivity() {
     private var recognitionIntent: Intent? = null
     private var isContinuousListening = false
     private var isRestartPending = false
+    private var manualListeningActive = false
+    private var isSpeechReady = false
+    private var resumeContinuousAfterManual = false
+    private var recognitionGeneration = 0
+    private var consecutiveRestartFailures = 0
+    private var languageTagOverride: String? = null
+    private var lastSoundEmitAt = 0L
+    private var readyWatchdog: Runnable? = null
+    private var audioPlaybackCallback: AudioManager.AudioPlaybackCallback? = null
+    private var externalMediaObservedActive = false
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    private companion object {
+        const val READY_TIMEOUT_MS = 5_000L
+        const val SOUND_LEVEL_MIN_INTERVAL_MS = 80L
+    }
 
     // Background Media / Music protection (avoids audio-focus theft that pauses YouTube / music players)
     private var mediaSuppressionUntil: Long = 0L
@@ -66,6 +86,11 @@ class MainActivity : FlutterActivity() {
         } catch (_: Exception) {
             false
         }
+    }
+
+    private fun hasMicrophonePermission(): Boolean {
+        return checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
     }
 
     private var mediaPlayer: android.media.MediaPlayer? = null
@@ -123,9 +148,12 @@ class MainActivity : FlutterActivity() {
     override fun onDestroy() {
         stopNativeListening()
         try {
-            speechRecognizer?.destroy()
-            speechRecognizer = null
+            audioPlaybackCallback?.let { callback ->
+                val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                audioManager?.unregisterAudioPlaybackCallback(callback)
+            }
         } catch (_: Exception) {}
+        audioPlaybackCallback = null
         try {
             mediaPlayer?.let {
                 if (it.isPlaying) it.stop()
@@ -193,76 +221,120 @@ class MainActivity : FlutterActivity() {
 
     private fun captureFrontCameraPhotoSilent(onCaptured: (String?, String?) -> Unit) {
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                val cm = getSystemService(Context.CAMERA_SERVICE) as? CameraManager
-                val frontCameraId = cm?.cameraIdList?.firstOrNull { id ->
-                    val chars = cm.getCameraCharacteristics(id)
-                    chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
-                } ?: cm?.cameraIdList?.firstOrNull()
+            val cm = getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+            val frontCameraId = cm?.cameraIdList?.firstOrNull { id ->
+                val chars = cm.getCameraCharacteristics(id)
+                chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
+            } ?: cm?.cameraIdList?.firstOrNull()
 
-                if (frontCameraId != null && cm != null) {
-                    val photoDir = File(cacheDir, "sentry_snapshots").apply { mkdirs() }
-                    val photoFile = File(photoDir, "sentry_intruder_${System.currentTimeMillis()}.jpg")
+            if (frontCameraId != null && cm != null) {
+                val photoDir = File(cacheDir, "sentry_snapshots").apply { mkdirs() }
+                val photoFile = File(photoDir, "sentry_intruder_${System.currentTimeMillis()}.jpg")
 
-                    val reader = android.media.ImageReader.newInstance(640, 480, android.graphics.ImageFormat.JPEG, 2)
-                    reader.setOnImageAvailableListener({ ir ->
+                val reader = android.media.ImageReader.newInstance(
+                    640,
+                    480,
+                    android.graphics.ImageFormat.JPEG,
+                    2,
+                )
+                var sessionRef: android.hardware.camera2.CameraCaptureSession? = null
+                var cameraRef: CameraDevice? = null
+                var finished = false
+                var timeout: Runnable? = null
+
+                fun finish(base64: String?, path: String?) {
+                    if (finished) return
+                    finished = true
+                    timeout?.let { mainHandler.removeCallbacks(it) }
+                    try { reader.close() } catch (_: Exception) {}
+                    try { sessionRef?.close() } catch (_: Exception) {}
+                    try { cameraRef?.close() } catch (_: Exception) {}
+                    onCaptured(base64, path)
+                }
+
+                timeout = Runnable { finish(null, null) }
+                mainHandler.postDelayed(timeout!!, 5_000L)
+
+                reader.setOnImageAvailableListener({ ir ->
+                    try {
+                        val img = ir.acquireLatestImage()
+                        if (img == null) {
+                            finish(null, null)
+                            return@setOnImageAvailableListener
+                        }
+                        var capturedBase64: String? = null
+                        var capturedPath: String? = null
                         try {
-                            val img = ir.acquireLatestImage()
-                            if (img != null) {
-                                val buffer = img.planes[0].buffer
-                                val bytes = ByteArray(buffer.remaining())
-                                buffer.get(bytes)
-                                img.close()
-                                photoFile.writeBytes(bytes)
-                                val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
-                                onCaptured(b64, photoFile.absolutePath)
-                                return@setOnImageAvailableListener
-                            }
-                        } catch (_: Exception) {}
-                        onCaptured(null, null)
-                    }, mainHandler)
+                            val buffer = img.planes[0].buffer
+                            val bytes = ByteArray(buffer.remaining())
+                            buffer.get(bytes)
+                            photoFile.writeBytes(bytes)
+                            capturedBase64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+                            capturedPath = photoFile.absolutePath
+                        } finally {
+                            img.close()
+                        }
+                        finish(capturedBase64, capturedPath)
+                    } catch (_: Exception) {
+                        finish(null, null)
+                    }
+                }, mainHandler)
 
-                    cm.openCamera(frontCameraId, object : CameraDevice.StateCallback() {
-                        override fun onOpened(camera: CameraDevice) {
-                            try {
-                                val captureBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
-                                captureBuilder.addTarget(reader.surface)
-                                camera.createCaptureSession(listOf(reader.surface), object : android.hardware.camera2.CameraCaptureSession.StateCallback() {
-                                    override fun onConfigured(session: android.hardware.camera2.CameraCaptureSession) {
+                cm.openCamera(frontCameraId, object : CameraDevice.StateCallback() {
+                    override fun onOpened(camera: CameraDevice) {
+                        cameraRef = camera
+                        try {
+                            val captureBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+                            captureBuilder.addTarget(reader.surface)
+                            camera.createCaptureSession(
+                                listOf(reader.surface),
+                                object : android.hardware.camera2.CameraCaptureSession.StateCallback() {
+                                    override fun onConfigured(
+                                        session: android.hardware.camera2.CameraCaptureSession,
+                                    ) {
+                                        sessionRef = session
                                         try {
-                                            session.capture(captureBuilder.build(), object : android.hardware.camera2.CameraCaptureSession.CaptureCallback() {
-                                                override fun onCaptureCompleted(s: android.hardware.camera2.CameraCaptureSession, request: android.hardware.camera2.CaptureRequest, total: android.hardware.camera2.TotalCaptureResult) {
-                                                    mainHandler.postDelayed({
-                                                        try { camera.close() } catch (_: Exception) {}
-                                                    }, 500L)
-                                                }
-                                            }, mainHandler)
+                                            session.capture(
+                                                captureBuilder.build(),
+                                                object : android.hardware.camera2.CameraCaptureSession.CaptureCallback() {
+                                                    override fun onCaptureCompleted(
+                                                        s: android.hardware.camera2.CameraCaptureSession,
+                                                        request: android.hardware.camera2.CaptureRequest,
+                                                        total: android.hardware.camera2.TotalCaptureResult,
+                                                    ) {
+                                                        // ImageReader will deliver the JPEG; finish()
+                                                        // closes the session and camera afterwards.
+                                                    }
+                                                },
+                                                mainHandler,
+                                            )
                                         } catch (_: Exception) {
-                                            try { camera.close() } catch (_: Exception) {}
-                                            onCaptured(null, null)
+                                            finish(null, null)
                                         }
                                     }
-                                    override fun onConfigureFailed(session: android.hardware.camera2.CameraCaptureSession) {
-                                        try { camera.close() } catch (_: Exception) {}
-                                        onCaptured(null, null)
+
+                                    override fun onConfigureFailed(
+                                        session: android.hardware.camera2.CameraCaptureSession,
+                                    ) {
+                                        finish(null, null)
                                     }
-                                }, mainHandler)
-                            } catch (e: Exception) {
-                                try { camera.close() } catch (_: Exception) {}
-                                onCaptured(null, null)
-                            }
+                                },
+                                mainHandler,
+                            )
+                        } catch (_: Exception) {
+                            finish(null, null)
                         }
-                        override fun onDisconnected(camera: CameraDevice) {
-                            try { camera.close() } catch (_: Exception) {}
-                            onCaptured(null, null)
-                        }
-                        override fun onError(camera: CameraDevice, error: Int) {
-                            try { camera.close() } catch (_: Exception) {}
-                            onCaptured(null, null)
-                        }
-                    }, mainHandler)
-                    return
-                }
+                    }
+
+                    override fun onDisconnected(camera: CameraDevice) {
+                        finish(null, null)
+                    }
+
+                    override fun onError(camera: CameraDevice, error: Int) {
+                        finish(null, null)
+                    }
+                }, mainHandler)
+                return
             }
         } catch (_: Exception) {}
         onCaptured(null, null)
@@ -405,10 +477,39 @@ class MainActivity : FlutterActivity() {
                 Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
             }
             else -> {
-                val custom = File(Environment.getExternalStorageDirectory(), name)
-                if (custom.exists() || custom.mkdirs()) custom else Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                val root = Environment.getExternalStorageDirectory().canonicalFile
+                val trimmed = name?.trim().orEmpty()
+                val custom = if (trimmed.isEmpty() ||
+                    trimmed == "." ||
+                    trimmed == ".." ||
+                    trimmed.contains('/') ||
+                    trimmed.contains('\\')
+                ) {
+                    null
+                } else {
+                    File(root, trimmed).canonicalFile
+                }
+                if (custom != null && custom.parentFile == root &&
+                    (custom.isDirectory || custom.mkdirs())
+                ) {
+                    custom
+                } else {
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                }
             }
         }.apply { mkdirs() }
+    }
+
+    private fun safeChildFile(directory: File, fileName: String): File? {
+        val name = fileName.trim()
+        if (name.isEmpty() || name == "." || name == ".." ||
+            name.contains('/') || name.contains('\\')
+        ) {
+            return null
+        }
+        val dir = directory.canonicalFile
+        val candidate = File(dir, name).canonicalFile
+        return if (candidate.parentFile == dir) candidate else null
     }
 
     private fun obtainSpeechRecognizer(): SpeechRecognizer {
@@ -438,238 +539,566 @@ class MainActivity : FlutterActivity() {
                lower.contains("j.a.r.v.i.s")
     }
 
-    private fun safeCancelAndDestroy() {
-        try {
-            speechRecognizer?.destroy()
-        } catch (_: Exception) {}
+    private fun emitStatus(status: String) {
+        mainHandler.post {
+            try {
+                speechChannel?.invokeMethod("onSpeechStatus", status)
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun emitSpeechError(code: Int, message: String, fatal: Boolean) {
+        mainHandler.post {
+            try {
+                speechChannel?.invokeMethod(
+                    "onSpeechError",
+                    mapOf(
+                        "code" to code,
+                        "message" to message,
+                        "fatal" to fatal,
+                    ),
+                )
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun speechErrorMessage(code: Int): String = when (code) {
+        SpeechRecognizer.ERROR_AUDIO -> "Microphone audio input failed"
+        SpeechRecognizer.ERROR_CLIENT -> "Speech recognizer client error"
+        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Microphone permission was denied"
+        SpeechRecognizer.ERROR_NETWORK -> "Speech recognition network error"
+        SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Speech recognition network timed out"
+        SpeechRecognizer.ERROR_NO_MATCH -> "No speech was recognized"
+        SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Speech recognizer is busy"
+        SpeechRecognizer.ERROR_SERVER -> "Speech recognition server error"
+        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No speech was detected"
+        SpeechRecognizer.ERROR_TOO_MANY_REQUESTS -> "Speech service is rate limited"
+        SpeechRecognizer.ERROR_SERVER_DISCONNECTED -> "Speech service disconnected"
+        SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED -> "The selected speech language is not supported"
+        SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE -> "The selected speech language is unavailable"
+        SpeechRecognizer.ERROR_CANNOT_CHECK_SUPPORT -> "The speech service could not check language support"
+        SpeechRecognizer.ERROR_CANNOT_LISTEN_TO_DOWNLOAD_EVENTS -> "The speech service cannot report download events"
+        else -> "Speech recognition failed (code $code)"
+    }
+
+    private fun isFatalSpeechError(code: Int): Boolean {
+        return code == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS ||
+            code == SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED ||
+            code == SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE ||
+            code == SpeechRecognizer.ERROR_CANNOT_CHECK_SUPPORT
+    }
+
+    private fun cancelReadyWatchdog() {
+        readyWatchdog?.let { mainHandler.removeCallbacks(it) }
+        readyWatchdog = null
+    }
+
+    private fun destroyRecognizer() {
+        cancelReadyWatchdog()
+        isSpeechReady = false
+        recognitionGeneration++
+        val existing = speechRecognizer
         speechRecognizer = null
+        recognitionIntent = null
+        try {
+            existing?.cancel()
+        } catch (_: Exception) {}
+        try {
+            existing?.destroy()
+        } catch (_: Exception) {}
     }
 
     private val restartRunnable = Runnable {
         isRestartPending = false
         if (!isContinuousListening) return@Runnable
 
-        // If background music or media is actively playing on the phone,
-        // DO NOT start SpeechRecognizer. Calling startListening() forces Google Speech Services
-        // to request audio focus (AUDIOFOCUS_GAIN_TRANSIENT), which causes active media players
-        // (YouTube, Spotify, etc.) to pause and resume in an endless loop.
+        // Never fight an active media player for audio focus. The playback
+        // callback below resumes recognition when the media session ends.
         if (isMediaPlaybackActive()) {
-            android.util.Log.d("JARVIS_VOICE", "Media/Music playback is active on device. Deferring SpeechRecognizer restart.")
-            scheduleRestart(1500L)
+            android.util.Log.d("JARVIS_VOICE", "Media playback active; waiting for it to stop")
+            emitStatus("mediaActive")
             return@Runnable
         }
 
-        try {
-            safeCancelAndDestroy()
-            val recognizer = obtainSpeechRecognizer().apply {
-                setRecognitionListener(recognitionListener)
-            }
-            speechRecognizer = recognizer
-            val intent = recognitionIntent ?: buildRecognitionIntent()
-            recognizer.startListening(intent)
-            android.util.Log.i("JARVIS_VOICE", "restartRunnable: recognizer restarted cleanly")
-        } catch (e: Exception) {
-            android.util.Log.e("JARVIS_VOICE", "restartRunnable failed: ${e.message}")
-            safeCancelAndDestroy()
-            scheduleRestart(150L)
-        }
+        startRecognition()
     }
 
     private fun scheduleRestart(delayMillis: Long) {
         if (!isContinuousListening) return
         isRestartPending = true
         mainHandler.removeCallbacks(restartRunnable)
-        mainHandler.postDelayed(restartRunnable, delayMillis)
+        mainHandler.postDelayed(restartRunnable, delayMillis.coerceAtLeast(50L))
     }
 
-    private val recognitionListener = object : RecognitionListener {
-        override fun onReadyForSpeech(params: Bundle?) {
-            isRestartPending = false
-            mainHandler.post {
-                speechChannel?.invokeMethod("onSpeechStatus", "listening")
-            }
-        }
+    private fun nextRestartDelay(baseMillis: Long): Long {
+        consecutiveRestartFailures = (consecutiveRestartFailures + 1).coerceAtMost(6)
+        val multiplier = 1L shl (consecutiveRestartFailures - 1)
+        return (baseMillis * multiplier).coerceAtMost(10_000L)
+    }
 
-        override fun onBeginningOfSpeech() {}
-
-        override fun onRmsChanged(rmsdB: Float) {
-            mainHandler.post {
-                speechChannel?.invokeMethod("onSoundLevel", rmsdB.toDouble())
-            }
-        }
-
-        override fun onBufferReceived(buffer: ByteArray?) {}
-
-        override fun onEndOfSpeech() {
-            mainHandler.post {
-                speechChannel?.invokeMethod("onSpeechStatus", "endOfSpeech")
-            }
-        }
-
-        override fun onError(error: Int) {
-            android.util.Log.i("JARVIS_VOICE", "onError: code=$error, isContinuous=$isContinuousListening")
-            mainHandler.post {
-                speechChannel?.invokeMethod("onSpeechStatus", "error:$error")
-            }
-
-            if (!isContinuousListening) {
-                mainHandler.post {
-                    speechChannel?.invokeMethod("onSpeechStatus", "notListening")
-                }
-                return
-            }
-
-            // Only stop if user explicitly revoked permission
-            if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
-                isContinuousListening = false
-                safeCancelAndDestroy()
-                mainHandler.post {
-                    speechChannel?.invokeMethod("onSpeechStatus", "notListening")
-                }
-                return
-            }
-
-            // For all timeouts, silence, client hiccups, busy signals, audio glitches:
-            // Destroy and re-arm cleanly so listening never stops!
-            safeCancelAndDestroy()
-            val delay = when (error) {
-                SpeechRecognizer.ERROR_NO_MATCH,
-                SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> 50L
-                SpeechRecognizer.ERROR_RECOGNIZER_BUSY,
-                SpeechRecognizer.ERROR_CLIENT -> 120L
-                else -> 250L
-            }
-            scheduleRestart(delay)
-        }
-
-        override fun onResults(results: Bundle?) {
-            val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-            val best = matches?.firstOrNull { containsWakeWord(it) } ?: matches?.firstOrNull() ?: ""
-            android.util.Log.i("JARVIS_VOICE", "onResults: best='$best', matches=$matches")
-            if (best.isNotEmpty()) {
-                mainHandler.post {
-                    speechChannel?.invokeMethod(
-                        "onSpeechResult",
-                        mapOf(
-                            "text" to best,
-                            "isFinal" to true,
-                            "candidates" to (matches ?: emptyList<String>())
-                        )
-                    )
-                }
-            }
-
+    private fun finishManualListening(resumeContinuous: Boolean) {
+        manualListeningActive = false
+        emitStatus("manualEnded")
+        if (resumeContinuousAfterManual && resumeContinuous) {
+            resumeContinuousAfterManual = false
+            isContinuousListening = true
+            scheduleRestart(200L)
+        } else {
+            resumeContinuousAfterManual = false
             if (isContinuousListening) {
-                scheduleRestart(50L)
+                scheduleRestart(200L)
             } else {
-                mainHandler.post {
-                    speechChannel?.invokeMethod("onSpeechStatus", "notListening")
-                }
+                destroyRecognizer()
+                emitStatus("notListening")
             }
         }
-
-        override fun onPartialResults(partialResults: Bundle?) {
-            val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-            val best = matches?.firstOrNull { containsWakeWord(it) } ?: matches?.firstOrNull() ?: ""
-            if (best.isNotEmpty()) {
-                mainHandler.post {
-                    speechChannel?.invokeMethod(
-                        "onSpeechResult",
-                        mapOf(
-                            "text" to best,
-                            "isFinal" to false,
-                            "candidates" to (matches ?: emptyList<String>())
-                        )
-                    )
-                }
-            }
-        }
-
-        override fun onSegmentResults(segmentResults: Bundle) {
-            val matches = segmentResults.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-            val best = matches?.firstOrNull { containsWakeWord(it) } ?: matches?.firstOrNull() ?: ""
-            if (best.isNotEmpty()) {
-                mainHandler.post {
-                    speechChannel?.invokeMethod(
-                        "onSpeechResult",
-                        mapOf(
-                            "text" to best,
-                            "isFinal" to false,
-                            "candidates" to (matches ?: emptyList<String>())
-                        )
-                    )
-                }
-            }
-        }
-
-        override fun onEndOfSegmentedSession() {
-            if (isContinuousListening) {
-                scheduleRestart(50L)
-            }
-        }
-
-        override fun onEvent(eventType: Int, params: Bundle?) {}
     }
 
-    private fun startNativeListening(continuous: Boolean, manual: Boolean = false) {
-        if (manual) {
-            // User explicitly initiated voice command (e.g. tap on HUD or mic);
-            // clear media suppression so the command is processed immediately.
-            mediaSuppressionUntil = 0L
-        } else if (isMediaPlaybackActive()) {
-            android.util.Log.i("JARVIS_VOICE", "startNativeListening: media is playing and manual=false, deferring speech recognition.")
-            isContinuousListening = continuous
-            scheduleRestart(1500L)
+    private fun handleSpeechError(error: Int, generation: Int) {
+        if (generation != recognitionGeneration) return
+        cancelReadyWatchdog()
+        isSpeechReady = false
+        emitStatus("error:$error")
+        val languageFallbackAvailable =
+            (error == SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED ||
+                error == SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE) &&
+                languageTagOverride != null
+        val fatal = isFatalSpeechError(error) && !languageFallbackAvailable
+        emitSpeechError(error, speechErrorMessage(error), fatal)
+        android.util.Log.i(
+            "JARVIS_VOICE",
+            "onError: code=$error, continuous=$isContinuousListening, manual=$manualListeningActive, fatal=$fatal",
+        )
+
+        if (manualListeningActive) {
+            destroyRecognizer()
+            finishManualListening(resumeContinuous = !fatal)
             return
         }
 
-        if (isContinuousListening && continuous && speechRecognizer != null) {
-            android.util.Log.i("JARVIS_VOICE", "startNativeListening: already listening continuously, skipping redundant restart")
+        if (!isContinuousListening) {
+            destroyRecognizer()
+            emitStatus("notListening")
             return
         }
-        android.util.Log.i("JARVIS_VOICE", "startNativeListening: continuous=$continuous, manual=$manual")
-        isContinuousListening = continuous
+
+        if (languageFallbackAvailable) {
+            // Retry once with the device language before giving up.
+            languageTagOverride = null
+            destroyRecognizer()
+            scheduleRestart(300L)
+            return
+        }
+
+        if (fatal) {
+            isContinuousListening = false
+            destroyRecognizer()
+            emitStatus("notListening")
+            return
+        }
+
+        val baseDelay = when (error) {
+            SpeechRecognizer.ERROR_NO_MATCH,
+            SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> 200L
+            SpeechRecognizer.ERROR_RECOGNIZER_BUSY,
+            SpeechRecognizer.ERROR_CLIENT -> 400L
+            SpeechRecognizer.ERROR_NETWORK,
+            SpeechRecognizer.ERROR_NETWORK_TIMEOUT,
+            SpeechRecognizer.ERROR_SERVER,
+            SpeechRecognizer.ERROR_SERVER_DISCONNECTED -> 1_000L
+            SpeechRecognizer.ERROR_TOO_MANY_REQUESTS -> 30_000L
+            else -> 600L
+        }
+        destroyRecognizer()
+        scheduleRestart(if (error == SpeechRecognizer.ERROR_TOO_MANY_REQUESTS) baseDelay else nextRestartDelay(baseDelay))
+    }
+
+    private fun startRecognition() {
+        val generation = ++recognitionGeneration
+        isSpeechReady = false
+        try {
+            if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                emitStatus("unavailable")
+                emitSpeechError(-2, "Speech recognition is not available on this device", true)
+                isContinuousListening = false
+                manualListeningActive = false
+                emitStatus("notListening")
+                return
+            }
+            if (!hasMicrophonePermission()) {
+                emitStatus("permissionDenied")
+                emitSpeechError(
+                    SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS,
+                    "Microphone permission is required",
+                    true,
+                )
+                isContinuousListening = false
+                manualListeningActive = false
+                emitStatus("notListening")
+                return
+            }
+
+            val recognizer = speechRecognizer ?: obtainSpeechRecognizer().also {
+                speechRecognizer = it
+            }
+            try {
+                recognizer.cancel()
+            } catch (_: Exception) {}
+            recognizer.setRecognitionListener(createRecognitionListener(generation))
+            val intent = buildRecognitionIntent()
+            recognitionIntent = intent
+            emitStatus("starting")
+            recognizer.startListening(intent)
+            android.util.Log.i(
+                "JARVIS_VOICE",
+                "startRecognition: continuous=$isContinuousListening, manual=$manualListeningActive",
+            )
+
+            val watchdog = Runnable {
+                if (generation != recognitionGeneration) return@Runnable
+                emitSpeechError(-3, "Speech engine did not become ready in time", false)
+                emitStatus("error:readyTimeout")
+                destroyRecognizer()
+                if (manualListeningActive) {
+                    finishManualListening(resumeContinuous = true)
+                } else if (isContinuousListening) {
+                    scheduleRestart(nextRestartDelay(500L))
+                } else {
+                    emitStatus("notListening")
+                }
+            }
+            readyWatchdog = watchdog
+            mainHandler.postDelayed(watchdog, READY_TIMEOUT_MS)
+        } catch (e: Exception) {
+            android.util.Log.e("JARVIS_VOICE", "startRecognition failed: ${e.message}")
+            emitSpeechError(-1, "Could not start speech recognition: ${e.message}", false)
+            destroyRecognizer()
+            if (manualListeningActive) {
+                finishManualListening(resumeContinuous = true)
+            } else if (isContinuousListening) {
+                scheduleRestart(nextRestartDelay(500L))
+            } else {
+                emitStatus("notListening")
+            }
+        }
+    }
+
+    private fun createRecognitionListener(generation: Int): RecognitionListener {
+        return object : RecognitionListener {
+            private fun isCurrent(): Boolean = generation == recognitionGeneration
+
+            override fun onReadyForSpeech(params: Bundle?) {
+                if (!isCurrent()) return
+                cancelReadyWatchdog()
+                consecutiveRestartFailures = 0
+                isRestartPending = false
+                isSpeechReady = true
+                emitStatus("listening")
+            }
+
+            override fun onBeginningOfSpeech() {}
+
+            override fun onRmsChanged(rmsdB: Float) {
+                if (!isCurrent()) return
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastSoundEmitAt < SOUND_LEVEL_MIN_INTERVAL_MS) return
+                lastSoundEmitAt = now
+                mainHandler.post {
+                    try {
+                        speechChannel?.invokeMethod("onSoundLevel", rmsdB.toDouble())
+                    } catch (_: Exception) {}
+                }
+            }
+
+            override fun onBufferReceived(buffer: ByteArray?) {}
+
+            override fun onEndOfSpeech() {
+                if (!isCurrent()) return
+                isSpeechReady = false
+                emitStatus("endOfSpeech")
+            }
+
+            override fun onError(error: Int) {
+                if (!isCurrent()) return
+                handleSpeechError(error, generation)
+            }
+
+            override fun onResults(results: Bundle?) {
+                if (!isCurrent()) return
+                cancelReadyWatchdog()
+                isSpeechReady = false
+                val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                val best = matches?.firstOrNull { containsWakeWord(it) }
+                    ?: matches?.firstOrNull()
+                    ?: ""
+                android.util.Log.i("JARVIS_VOICE", "onResults: best='$best', matches=$matches")
+                if (best.isNotEmpty()) {
+                    mainHandler.post {
+                        try {
+                            speechChannel?.invokeMethod(
+                                "onSpeechResult",
+                                mapOf(
+                                    "text" to best,
+                                    "isFinal" to true,
+                                    "candidates" to (matches ?: emptyList<String>()),
+                                ),
+                            )
+                        } catch (_: Exception) {}
+                    }
+                }
+
+                if (manualListeningActive) {
+                    finishManualListening(resumeContinuous = true)
+                } else if (isContinuousListening) {
+                    scheduleRestart(250L)
+                } else {
+                    emitStatus("notListening")
+                }
+            }
+
+            override fun onPartialResults(partialResults: Bundle?) {
+                if (!isCurrent()) return
+                val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                val best = matches?.firstOrNull { containsWakeWord(it) }
+                    ?: matches?.firstOrNull()
+                    ?: ""
+                if (best.isNotEmpty()) {
+                    mainHandler.post {
+                        try {
+                            speechChannel?.invokeMethod(
+                                "onSpeechResult",
+                                mapOf(
+                                    "text" to best,
+                                    "isFinal" to false,
+                                    "candidates" to (matches ?: emptyList<String>()),
+                                ),
+                            )
+                        } catch (_: Exception) {}
+                    }
+                }
+            }
+
+            override fun onSegmentResults(segmentResults: Bundle) {
+                if (!isCurrent()) return
+                val matches = segmentResults.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                val best = matches?.firstOrNull { containsWakeWord(it) }
+                    ?: matches?.firstOrNull()
+                    ?: ""
+                if (best.isNotEmpty()) {
+                    mainHandler.post {
+                        try {
+                            speechChannel?.invokeMethod(
+                                "onSpeechResult",
+                                mapOf(
+                                    "text" to best,
+                                    "isFinal" to false,
+                                    "candidates" to (matches ?: emptyList<String>()),
+                                ),
+                            )
+                        } catch (_: Exception) {}
+                    }
+                }
+            }
+
+            override fun onEndOfSegmentedSession() {
+                if (!isCurrent()) return
+                isSpeechReady = false
+                if (isContinuousListening) {
+                    scheduleRestart(250L)
+                }
+            }
+
+            override fun onEvent(eventType: Int, params: Bundle?) {}
+        }
+    }
+
+    private fun startNativeListening(
+        continuous: Boolean,
+        manual: Boolean = false,
+        languageTag: String? = null,
+    ): Map<String, Any?> {
+        if (!languageTag.isNullOrBlank()) {
+            languageTagOverride = languageTag
+        }
+
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            isContinuousListening = false
+            manualListeningActive = false
+            mainHandler.removeCallbacks(restartRunnable)
+            isRestartPending = false
+            destroyRecognizer()
+            emitStatus("unavailable")
+            emitSpeechError(-2, "Speech recognition is not available on this device", true)
+            return mapOf("accepted" to false, "deferred" to false, "reason" to "unavailable")
+        }
+
+        if (!hasMicrophonePermission()) {
+            isContinuousListening = false
+            manualListeningActive = false
+            mainHandler.removeCallbacks(restartRunnable)
+            isRestartPending = false
+            destroyRecognizer()
+            emitStatus("permissionDenied")
+            emitSpeechError(
+                SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS,
+                "Microphone permission is required",
+                true,
+            )
+            return mapOf("accepted" to false, "deferred" to false, "reason" to "permissionDenied")
+        }
+
+        if (manual) {
+            // Explicit user/assistant action may temporarily override media
+            // suppression. One-shot recognition does not take over continuous mode.
+            mediaSuppressionUntil = 0L
+            resumeContinuousAfterManual = isContinuousListening
+            manualListeningActive = true
+            isContinuousListening = false
+        } else {
+            if (isMediaPlaybackActive()) {
+                android.util.Log.i("JARVIS_VOICE", "Media is playing; deferring recognition")
+                isContinuousListening = continuous
+                manualListeningActive = false
+                resumeContinuousAfterManual = false
+                destroyRecognizer()
+                emitStatus("mediaActive")
+                val suppressionRemaining =
+                    (mediaSuppressionUntil - System.currentTimeMillis()).coerceAtLeast(0L)
+                // Retry once after the suppression window, or after a short
+                // delay for transient own-TTS playback. External media is
+                // resumed by the audio playback callback.
+                scheduleRestart(if (suppressionRemaining > 0L) suppressionRemaining + 250L else 750L)
+                return mapOf("accepted" to false, "deferred" to true, "reason" to "mediaActive")
+            }
+            manualListeningActive = false
+            resumeContinuousAfterManual = false
+            isContinuousListening = continuous
+        }
+
+        if (continuous && speechRecognizer != null && isSpeechReady && !isRestartPending) {
+            android.util.Log.i("JARVIS_VOICE", "Continuous recognizer already active")
+            return mapOf("accepted" to true, "deferred" to false, "alreadyListening" to true)
+        }
+
         mainHandler.removeCallbacks(restartRunnable)
         isRestartPending = false
-        mainHandler.post {
-            try {
-                safeCancelAndDestroy()
-                val recognizer = obtainSpeechRecognizer().apply {
-                    setRecognitionListener(recognitionListener)
-                }
-                speechRecognizer = recognizer
-                val intent = buildRecognitionIntent()
-                recognitionIntent = intent
-                recognizer.startListening(intent)
-                speechChannel?.invokeMethod("onSpeechStatus", "listening")
-            } catch (e: Exception) {
-                android.util.Log.e("JARVIS_VOICE", "startNativeListening failed: ${e.message}")
-                safeCancelAndDestroy()
-                speechChannel?.invokeMethod("onSpeechStatus", "error:${e.message}")
-            }
-        }
+        startRecognition()
+        return mapOf("accepted" to true, "deferred" to false)
     }
 
     private fun stopNativeListening() {
         android.util.Log.i("JARVIS_VOICE", "stopNativeListening called")
         isContinuousListening = false
-        mainHandler.removeCallbacks(restartRunnable)
+        manualListeningActive = false
+        resumeContinuousAfterManual = false
         isRestartPending = false
-        mainHandler.post {
-            safeCancelAndDestroy()
-            speechChannel?.invokeMethod("onSpeechStatus", "notListening")
+        mainHandler.removeCallbacks(restartRunnable)
+        destroyRecognizer()
+        emitStatus("notListening")
+    }
+
+    private fun suppressRecognitionForMedia(durationMs: Long) {
+        mediaSuppressionUntil = System.currentTimeMillis() + durationMs.coerceAtLeast(0L)
+        android.util.Log.i("JARVIS_VOICE", "Suppressing recognition for ${durationMs}ms")
+        if (manualListeningActive) {
+            manualListeningActive = false
+            isContinuousListening = resumeContinuousAfterManual
+            resumeContinuousAfterManual = false
+        }
+        destroyRecognizer()
+        emitStatus("mediaActive")
+        if (isContinuousListening) {
+            // Check exactly once when the suppression window ends instead of
+            // polling every second and stealing audio focus from the media app.
+            scheduleRestart(durationMs + 250L)
         }
     }
 
     private fun buildRecognitionIntent(): Intent {
+        val locale = if (!languageTagOverride.isNullOrBlank()) {
+            Locale.forLanguageTag(languageTagOverride!!)
+        } else {
+            val locales = resources.configuration.locales
+            if (locales.size() > 0) locales[0] else Locale.getDefault()
+        }
+        val primaryLanguage = locale.toLanguageTag()
+
         return Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
             putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, primaryLanguage)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, primaryLanguage)
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 3000L)
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 2500L)
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 100L)
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                val allowedLanguages = ArrayList(
+                    arrayListOf(
+                        primaryLanguage,
+                        "en-IN",
+                        "hi-IN",
+                        "en-US",
+                        "en-GB",
+                    ).distinct(),
+                )
+                putStringArrayListExtra(
+                    RecognizerIntent.EXTRA_LANGUAGE_DETECTION_ALLOWED_LANGUAGES,
+                    allowedLanguages,
+                )
+                putStringArrayListExtra(
+                    RecognizerIntent.EXTRA_LANGUAGE_SWITCH_ALLOWED_LANGUAGES,
+                    allowedLanguages,
+                )
+                putExtra(RecognizerIntent.EXTRA_ENABLE_LANGUAGE_DETECTION, true)
+                putExtra(RecognizerIntent.EXTRA_ENABLE_LANGUAGE_SWITCH, true)
+            }
+        }
+    }
+
+    private fun setupAudioPlaybackCallback() {
+        if (audioPlaybackCallback != null) return
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        // AudioPlaybackConfiguration's active/UID getters are not public SDK
+        // API, so use the public music-active signal for audio-focus arbitration.
+        externalMediaObservedActive = audioManager.isMusicActive
+        val callback = object : AudioManager.AudioPlaybackCallback() {
+            override fun onPlaybackConfigChanged(configs: MutableList<AudioPlaybackConfiguration>?) {
+                val activeExternalMedia = audioManager.isMusicActive
+
+                if (activeExternalMedia) {
+                    externalMediaObservedActive = true
+                    if (speechRecognizer != null && !manualListeningActive) {
+                        destroyRecognizer()
+                        emitStatus("mediaActive")
+                    }
+                    return
+                }
+
+                if (externalMediaObservedActive) {
+                    externalMediaObservedActive = false
+                    // The media session that justified suppression has ended.
+                    mediaSuppressionUntil = 0L
+                }
+
+                // Do not resume during our own TTS/audio suppression window.
+                if (System.currentTimeMillis() < mediaSuppressionUntil) return
+                if (isContinuousListening && !manualListeningActive && speechRecognizer == null) {
+                    // Replace any delayed media-suppression retry with an
+                    // immediate restart now that playback has actually ended.
+                    mainHandler.removeCallbacks(restartRunnable)
+                    isRestartPending = false
+                    scheduleRestart(250L)
+                }
+            }
+        }
+        audioPlaybackCallback = callback
+        try {
+            audioManager.registerAudioPlaybackCallback(callback, mainHandler)
+        } catch (_: Exception) {
+            audioPlaybackCallback = null
         }
     }
 
@@ -684,8 +1113,8 @@ class MainActivity : FlutterActivity() {
                 "startListening" -> {
                     val continuous = call.argument<Boolean>("continuous") ?: true
                     val manual = call.argument<Boolean>("manual") ?: false
-                    startNativeListening(continuous, manual)
-                    result.success(true)
+                    val language = call.argument<String>("language")
+                    result.success(startNativeListening(continuous, manual, language))
                 }
                 "stopListening" -> {
                     stopNativeListening()
@@ -693,10 +1122,7 @@ class MainActivity : FlutterActivity() {
                 }
                 "notifyMediaStarted" -> {
                     val durationMs = (call.argument<Number>("durationMs")?.toLong()) ?: 30000L
-                    mediaSuppressionUntil = System.currentTimeMillis() + durationMs
-                    android.util.Log.i("JARVIS_VOICE", "notifyMediaStarted: suppressing speech recognition for ${durationMs}ms")
-                    safeCancelAndDestroy()
-                    scheduleRestart(1500L)
+                    suppressRecognitionForMedia(durationMs)
                     result.success(true)
                 }
                 "isAvailable" -> {
@@ -711,6 +1137,7 @@ class MainActivity : FlutterActivity() {
         val aChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
         accessibilityChannel = aChannel
         setupPowerReceiver()
+        setupAudioPlaybackCallback()
         aChannel.setMethodCallHandler { call, result ->
                 val service = AgentAccessibilityService.instance
                 when (call.method) {
@@ -1192,11 +1619,11 @@ class MainActivity : FlutterActivity() {
                             val targetDir = getTargetFolder(folderName)
                             when (action) {
                                 "create", "write" -> {
-                                    if (fileName.isEmpty()) {
-                                        result.error("INVALID_FILE", "File name cannot be empty", null)
+                                    val file = safeChildFile(targetDir, fileName)
+                                    if (file == null) {
+                                        result.error("INVALID_FILE", "Invalid file name", null)
                                         return@setMethodCallHandler
                                     }
-                                    val file = File(targetDir, fileName)
                                     if (append && file.exists()) {
                                         file.appendText(content)
                                     } else {
@@ -1212,8 +1639,8 @@ class MainActivity : FlutterActivity() {
                                     ))
                                 }
                                 "read" -> {
-                                    val file = File(targetDir, fileName)
-                                    if (!file.exists()) {
+                                    val file = safeChildFile(targetDir, fileName)
+                                    if (file == null || !file.exists()) {
                                         result.error("NOT_FOUND", "File $fileName not found in $folderName", null)
                                         return@setMethodCallHandler
                                     }
@@ -1242,8 +1669,8 @@ class MainActivity : FlutterActivity() {
                                     ))
                                 }
                                 "delete" -> {
-                                    val file = File(targetDir, fileName)
-                                    val deleted = if (file.exists()) file.delete() else false
+                                    val file = safeChildFile(targetDir, fileName)
+                                    val deleted = if (file != null && file.exists()) file.delete() else false
                                     result.success(mapOf(
                                         "success" to deleted,
                                         "message" to if (deleted) "File $fileName deleted." else "File $fileName could not be deleted."

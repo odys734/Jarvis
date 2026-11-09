@@ -22,18 +22,36 @@ class _BrainDumpDialogState extends State<BrainDumpDialog> {
   String? _lastSummary;
 
   @override
+  void initState() {
+    super.initState();
+    VoiceService.instance.manualSessionActive.addListener(_onManualSessionChanged);
+  }
+
+  void _onManualSessionChanged() {
+    if (!mounted || VoiceService.instance.manualSessionActive.value) return;
+    if (_isDictating) {
+      setState(() => _isDictating = false);
+    }
+  }
+
+  @override
   void dispose() {
+    VoiceService.instance.manualSessionActive.removeListener(
+          _onManualSessionChanged,
+        );
+    VoiceService.instance.releaseResultHandler(this);
     _textController.dispose();
     _scrollController.dispose();
     super.dispose();
   }
 
-  void _startDictation() {
+  Future<void> _startDictation() async {
     setState(() => _isDictating = true);
     HapticFeedback.mediumImpact();
 
-    VoiceService.instance.startListening(
+    final started = await VoiceService.instance.startListening(
       manual: true,
+      owner: this,
       onResult: (text, isFinal, candidates) {
         if (!mounted) return;
         if (text.trim().isNotEmpty) {
@@ -44,6 +62,15 @@ class _BrainDumpDialogState extends State<BrainDumpDialog> {
         }
       },
     );
+    if (!started && mounted) {
+      setState(() => _isDictating = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(VoiceService.instance.lastError ??
+              'Microphone could not start'),
+        ),
+      );
+    }
   }
 
   Future<void> _processDump() async {

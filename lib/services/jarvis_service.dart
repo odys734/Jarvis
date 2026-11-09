@@ -122,6 +122,7 @@ class JarvisService extends ChangeNotifier {
   Timer? _followUpSilenceTimer;
   bool _isInFollowUp = false;
   bool get isInFollowUp => _isInFollowUp;
+  bool _manualStartInProgress = false;
   ProactiveSuggestion? _pendingProactiveSuggestion;
   final List<Map<String, String>> _dialogHistory = [];
 
@@ -168,17 +169,78 @@ class JarvisService extends ChangeNotifier {
     });
 
     _voice.onSpeechStatus = (status) {
-      if (status == 'endOfSpeech') {
-        if (_isAwake && _lastUserSpeech.isNotEmpty) {
-          _speechSilenceTimer?.cancel();
-          _speechSilenceTimer = Timer(const Duration(milliseconds: 350), () {
-            final trimmed = _lastUserSpeech.trim();
-            if (trimmed.isNotEmpty) {
-              unawaited(_handleSpeechResult(trimmed));
-            }
-          });
-        }
+      switch (status) {
+        case 'listening':
+          if (_phase == JarvisPhase.thinking ||
+              _phase == JarvisPhase.executing ||
+              _phase == JarvisPhase.speaking) {
+            break;
+          }
+          if (_isAwake) {
+            _phase = JarvisPhase.listening;
+            _statusMessage = 'LISTENING // AUDIO RECEPTORS ACTIVE';
+          } else if (_shouldListenContinuously) {
+            _phase = JarvisPhase.idle;
+            _statusMessage = 'STANDBY // SAY "HEY JARVIS"';
+          }
+          notifyListeners();
+          break;
+        case 'endOfSpeech':
+          if (_isAwake && _lastUserSpeech.isNotEmpty) {
+            _speechSilenceTimer?.cancel();
+            _speechSilenceTimer = Timer(const Duration(milliseconds: 350), () {
+              final trimmed = _lastUserSpeech.trim();
+              if (trimmed.isNotEmpty) {
+                unawaited(_handleSpeechResult(trimmed));
+              }
+            });
+          }
+          break;
+        case 'manualEnded':
+          if (!_shouldListenContinuously &&
+              _phase == JarvisPhase.listening) {
+            _phase =
+                _executor.isBusy ? JarvisPhase.executing : JarvisPhase.idle;
+            _statusMessage = 'READY // TAP TO TALK';
+            notifyListeners();
+          }
+          // Native normally resumes continuous mode after a manual capture,
+          // but it cannot know about a continuous session that was stopped for
+          // TTS before the manual capture began. Recover that case after
+          // VoiceService has cleared its manual-session state.
+          if (_shouldListenContinuously) {
+            unawaited(Future<void>.microtask(() {
+              if (_shouldListenContinuously &&
+                  !_manualStartInProgress &&
+                  !_voice.manualSessionActive.value &&
+                  !_voice.isListening) {
+                startListening();
+              }
+            }));
+          }
+          break;
+        case 'mediaActive':
+          if (_phase == JarvisPhase.listening) {
+            _phase = _executor.isBusy ? JarvisPhase.executing : JarvisPhase.idle;
+          }
+          _statusMessage = 'MEDIA PLAYING // MICROPHONE PAUSED';
+          notifyListeners();
+          break;
+        case 'unavailable':
+          _statusMessage = 'SPEECH UNAVAILABLE // CHECK VOICE INPUT';
+          notifyListeners();
+          break;
+        case 'permissionDenied':
+          _statusMessage = 'MIC PERMISSION REQUIRED';
+          notifyListeners();
+          break;
       }
+    };
+
+    _voice.onSpeechError = (message) {
+      if (message.toLowerCase().contains('no speech')) return;
+      _statusMessage = 'VOICE ERROR // ${message.toUpperCase()}';
+      notifyListeners();
     };
 
     _voice.isSpeaking.addListener(() {
@@ -193,8 +255,13 @@ class JarvisService extends ChangeNotifier {
           _phase = _executor.isBusy ? JarvisPhase.executing : JarvisPhase.idle;
           notifyListeners();
         }
-        // Continuous listening trigger: when speech output finishes, resume passive wake-word listening
-        if (_shouldListenContinuously) {
+        // Continuous listening trigger: when speech output finishes, resume
+        // passive wake-word listening. Never let this race an explicit
+        // manual start or an already-active microphone session.
+        if (_shouldListenContinuously &&
+            !_manualStartInProgress &&
+            !_voice.manualSessionActive.value &&
+            !_voice.isListening) {
           if (_isAwake) {
             _keepAwake();
           }
@@ -204,7 +271,7 @@ class JarvisService extends ChangeNotifier {
     });
 
     _voice.listeningNotifier.addListener(() {
-      if (!_voice.listeningNotifier.value) {
+      if (!_voice.listeningNotifier.value && _shouldListenContinuously) {
         if (_phase == JarvisPhase.listening) {
           _phase = _executor.isBusy ? JarvisPhase.executing : JarvisPhase.idle;
           notifyListeners();
@@ -278,11 +345,15 @@ class JarvisService extends ChangeNotifier {
 
     _wakeUp();
     _isInFollowUp = true;
-    _phase = JarvisPhase.listening;
-    _statusMessage = 'LISTENING // ASK A FOLLOW-UP OR COMMAND';
+    _statusMessage = 'INITIALIZING FOLLOW-UP MIC';
     notifyListeners();
 
-    await startListening(manual: true);
+    final started = await startListening(manual: true);
+    if (!started) {
+      _isInFollowUp = false;
+      _standDown();
+      return;
+    }
 
     // 7.5 second conversational window before standing down
     _followUpSilenceTimer = Timer(const Duration(milliseconds: 7500), () {
@@ -305,10 +376,15 @@ class JarvisService extends ChangeNotifier {
     startListening();
   }
 
-  /// Stops Always-On supervision.
+  /// Stops Always-On supervision while preserving an active JARVIS session.
   void stopAlwaysOn() {
     _standDown();
+    if (_isInJarvisMode) {
+      startListening();
+      return;
+    }
     stopListening();
+    _voice.releaseResultHandler(this);
   }
 
   /// Extracts the wake word command from speech with robust normalization.
@@ -421,10 +497,12 @@ class JarvisService extends ChangeNotifier {
     unawaited(AirGestureService.instance.stop());
     // Always-On mode listens continuously across the app like Google Assistant
     if (!isAlwaysOn) {
+      final wasJarvisListening = _phase == JarvisPhase.listening;
       _standDown();
-      if (_phase == JarvisPhase.listening) {
+      if (wasJarvisListening) {
         stopListening();
       }
+      _voice.releaseResultHandler(this);
     }
   }
 
@@ -494,8 +572,7 @@ class JarvisService extends ChangeNotifier {
 
     if (SettingsService.instance.proactiveVoiceConfirmationEnabled) {
       _wakeUp();
-      _phase = JarvisPhase.listening;
-      _statusMessage = 'AWAITING RESPONSE // SAY "YES" OR "NO"';
+      _statusMessage = 'INITIALIZING CONFIRMATION MIC';
       notifyListeners();
 
       await startListening(manual: true);
@@ -570,18 +647,34 @@ class JarvisService extends ChangeNotifier {
 
   /// Begins recording voice input.
   Future<bool> startListening({bool manual = false}) async {
+    if (manual) _manualStartInProgress = true;
+    try {
+      return await _startListeningInternal(manual: manual);
+    } finally {
+      if (manual) _manualStartInProgress = false;
+    }
+  }
+
+  Future<bool> _startListeningInternal({required bool manual}) async {
+    // An explicit manual capture (another screen or the user) takes precedence
+    // over background continuous restarts.
+    if (!manual &&
+        (_manualStartInProgress || _voice.manualSessionActive.value)) {
+      return false;
+    }
+
     await _voice.stopSpeaking();
 
     if (manual) {
       _wakeUp();
     }
 
-    // Google Home / Google Assistant Architecture:
-    // Only set phase to listening if awake or manual tap.
-    // In passive standby background waiting for wake-word, stay in idle so UI is calm and does NOT flicker!
-    if (_isAwake || !_shouldListenContinuously) {
-      _phase = JarvisPhase.listening;
-      _statusMessage = 'LISTENING // AUDIO RECEPTORS ACTIVE';
+    // Do not report LISTENING until the native engine confirms readiness. In
+    // passive standby we keep the calm idle state while the wake-word engine
+    // starts in the background.
+    final shouldShowListening = _isAwake || !_shouldListenContinuously;
+    if (shouldShowListening) {
+      _statusMessage = 'INITIALIZING MICROPHONE';
     } else {
       _phase = JarvisPhase.idle;
       _statusMessage = 'STANDBY // SAY "HEY JARVIS"';
@@ -591,8 +684,10 @@ class JarvisService extends ChangeNotifier {
     final started = await _voice.startListening(
       continuous: _shouldListenContinuously,
       manual: manual,
+      owner: this,
       onResult: (words, isFinal, candidates) {
         _lastUserSpeech = words;
+        if (_isAwake) _keepAwake();
         debugPrint('[JarvisService] Heard: "$words" (candidates: $candidates, isFinal: $isFinal, isAwake: $_isAwake)');
 
         // Immediate wake detection on partial speech stream
@@ -658,7 +753,15 @@ class JarvisService extends ChangeNotifier {
 
     if (!started) {
       _phase = _executor.isBusy ? JarvisPhase.executing : JarvisPhase.idle;
-      _statusMessage = 'MICROPHONE UNAVAILABLE';
+      final error = _voice.lastError;
+      _statusMessage = error != null &&
+              error.toLowerCase().contains('media')
+          ? 'MEDIA PLAYING // MICROPHONE PAUSED'
+          : 'MIC UNAVAILABLE // ${error ?? 'CHECK PERMISSIONS'}';
+      notifyListeners();
+    } else if (shouldShowListening) {
+      _phase = JarvisPhase.listening;
+      _statusMessage = 'LISTENING // AUDIO RECEPTORS ACTIVE';
       notifyListeners();
     }
     return started;
