@@ -48,6 +48,7 @@ class VoiceService {
   void Function(String message)? onSpeechError;
   void Function(String words, bool isFinal, List<String> candidates)? onSpeechResult;
 
+  bool get _settingsSpeechEngineIsSystem => SettingsService.instance.speechEngine == 'system';
   bool get isListening => _listening;
   bool get isAvailable => _speechReady;
   String? get lastError => _lastError;
@@ -57,6 +58,20 @@ class VoiceService {
   void _initNativeSpeechChannel() {
     _nativeSpeechChannel.setMethodCallHandler((call) async {
       switch (call.method) {
+        case 'onSystemSttResult':
+          final args = call.arguments as Map?;
+          final text = (args?['text'] ?? '').toString();
+          final candidates = (args?['candidates'] as List?)?.map((e) => e.toString()).toList() ?? <String>[];
+          if (text.isNotEmpty) _dispatchSpeechResult(text, true, candidates.isEmpty ? [text] : candidates);
+          _nativeReady = false;
+          _setListening(false);
+          _completeStart(true);
+          break;
+        case 'onSystemSttCancelled':
+          _nativeReady = false;
+          _setListening(false);
+          _completeStart(false);
+          break;
         case 'onSpeechResult':
           final args = call.arguments as Map?;
           final text = (args?['text'] ?? '').toString();
@@ -384,6 +399,19 @@ class VoiceService {
     Object? owner,
     String? language,
   }) async {
+    if (_settingsSpeechEngineIsSystem) {
+      if (!await _ensureMicPermission()) return false;
+      _registerResultHandler(continuous: false, owner: owner, handler: onResult);
+      _completeStart(false);
+      final raw = await _nativeSpeechChannel.invokeMethod<dynamic>('startSystemStt', <String, dynamic>{if (language != null && language.isNotEmpty) 'language': language});
+      final response = raw is Map ? raw : const <Object?, Object?>{};
+      if (response['accepted'] != true) {
+        _endManualSession();
+        _lastError = 'Android System STT is unavailable';
+        return false;
+      }
+      return true;
+    }
     if (!await initSpeech()) return false;
 
     // An explicit manual capture owns the microphone until it finishes. Do
