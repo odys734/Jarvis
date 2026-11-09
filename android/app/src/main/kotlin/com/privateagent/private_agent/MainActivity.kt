@@ -1063,7 +1063,7 @@ class MainActivity : FlutterActivity() {
             isContinuousListening = true
             val serviceIntent = Intent(this, VoiceKeepAliveService::class.java).apply {
                 action = VoiceKeepAliveService.ACTION_START
-                if (!languageTag.isNullOrBlank()) putExtra(VoiceKeepAliveService.EXTRA_LANGUAGE, languageTag)
+                (languageTag ?: languageTagOverride)?.let { putExtra(VoiceKeepAliveService.EXTRA_LANGUAGE, it) }
             }
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(serviceIntent)
