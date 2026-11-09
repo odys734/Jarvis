@@ -31,9 +31,9 @@ Future<void> main() async {
   await CalendarReminderService.instance.init();
   await TodoService.instance.init();
 
-  if (settings.jarvisAlwaysOn) {
-    JarvisService.instance.ensureAlwaysOnRunning();
-  }
+  // Start microphone listening only after HomeScreen is rendered and the
+  // user-facing permission flow can be shown. Starting it before runApp()
+  // can make Android permission requests fail silently or never appear.
 
   _wireTelegram(executor, settings);
   _wireOverlayCommands(executor);
