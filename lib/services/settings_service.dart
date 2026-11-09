@@ -240,6 +240,13 @@ class SettingsService extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Speech engine: native background engine or Android's system speech UI fallback.
+  String get speechEngine => _prefs?.getString('speech_engine') ?? 'continuous';
+  Future<void> setSpeechEngine(String value) async {
+    await _prefs?.setString('speech_engine', value);
+    notifyListeners();
+  }
+
   /// Voice profile: 'paul' (British Jarvis), 'friday' (Irish), 'stark' (US), 'kip' (Deep), 'cortana' (Smooth).
   String get jarvisVoice => _prefs?.getString('jarvis_voice') ?? 'paul';
   Future<void> setJarvisVoice(String value) async {
