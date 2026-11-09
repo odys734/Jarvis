@@ -35,6 +35,8 @@ class VoiceService {
   void Function(String, bool, List<String>)? _legacyContinuousHandler;
   void Function(String, bool, List<String>)? _legacyManualHandler;
   bool _manualSessionActive = false;
+  bool _continuousSessionRequested = false;
+  String? _activeLanguage;
 
   final ValueNotifier<bool> isSpeaking = ValueNotifier<bool>(false);
   final ValueNotifier<double> soundLevel = ValueNotifier<double>(0.0);
@@ -396,6 +398,10 @@ class VoiceService {
       owner: owner,
       handler: onResult,
     );
+    if (continuous && !manual) {
+      _continuousSessionRequested = true;
+      _activeLanguage = language;
+    }
 
     if (_listening && _nativeReady && continuous && !manual && !_manualSessionActive) {
       return true;
@@ -421,6 +427,7 @@ class VoiceService {
       final reason = response['reason']?.toString();
 
       if (!accepted || deferred) {
+        if (continuous && !manual) _continuousSessionRequested = false;
         _nativeReady = false;
         _lastError = _messageForStartReason(reason);
         if (manual) _endManualSession();
@@ -477,6 +484,7 @@ class VoiceService {
 
   /// Stops speech recognition immediately.
   Future<void> stopListening() async {
+    _continuousSessionRequested = false;
     _endManualSession();
     _nativeReady = false;
     _setListening(false);
@@ -505,9 +513,10 @@ class VoiceService {
     final clean = sanitizeForSpeech(text);
     if (clean.isEmpty) return;
 
-    // Temporarily pause microphone while speaking to eliminate echo and feedback
-    final wasListening = _listening;
-    if (wasListening) {
+    // Pause microphone while speaking to eliminate echo and feedback. Keep the
+    // user's continuous-session intent so it can resume after TTS completes.
+    final resumeContinuous = _continuousSessionRequested;
+    if (_listening || resumeContinuous) {
       await stopListening();
     }
 
@@ -543,6 +552,29 @@ class VoiceService {
       }
     } finally {
       isSpeaking.value = false;
+      if (resumeContinuous) {
+        _continuousSessionRequested = true;
+        try {
+          final raw = await _nativeSpeechChannel.invokeMethod<dynamic>(
+            'startListening',
+            <String, dynamic>{
+              'continuous': true,
+              'manual': false,
+              if (_activeLanguage != null && _activeLanguage!.isNotEmpty)
+                'language': _activeLanguage,
+            },
+          );
+          final response = raw is Map ? raw : const <Object?, Object?>{};
+          if (response['accepted'] == false || response['deferred'] == true) {
+            _continuousSessionRequested = false;
+            _lastError = 'Continuous listening could not resume after speaking';
+          }
+        } catch (e) {
+          _continuousSessionRequested = false;
+          _lastError = 'Continuous listening could not resume: $e';
+          debugPrint('[VoiceService] Resume after TTS failed: $e');
+        }
+      }
     }
   }
 
