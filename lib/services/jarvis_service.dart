@@ -297,9 +297,9 @@ class JarvisService extends ChangeNotifier {
       }
     });
 
-    if (isAlwaysOn) {
-      ensureAlwaysOnRunning();
-    }
+    // Initial microphone startup is owned by HomeScreen's post-frame
+    // permission flow. Do not start SpeechRecognizer from this constructor:
+    // doing so races the Activity permission prompt and the HomeScreen startup.
   }
 
   void _wakeUp() {
