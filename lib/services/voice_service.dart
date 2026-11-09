@@ -64,11 +64,13 @@ class VoiceService {
           final candidates = (args?['candidates'] as List?)?.map((e) => e.toString()).toList() ?? <String>[];
           if (text.isNotEmpty) _dispatchSpeechResult(text, true, candidates.isEmpty ? [text] : candidates);
           _nativeReady = false;
+          _endManualSession();
           _setListening(false);
           _completeStart(true);
           break;
         case 'onSystemSttCancelled':
           _nativeReady = false;
+          _endManualSession();
           _setListening(false);
           _completeStart(false);
           break;
