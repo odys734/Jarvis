@@ -30,6 +30,7 @@ class VoiceKeepAliveService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var recognizer: SpeechRecognizer? = null
     private var running = false
+    private var speechReady = false
     private var generation = 0
     private var languageTag: String? = null
     private var retryCount = 0
@@ -58,7 +59,9 @@ class VoiceKeepAliveService : Service() {
                 startAsForeground()
                 acquireWakeLock()
                 running = true
+                isRunning = true
                 if (recognizer == null) scheduleRecognition(150L)
+                else publish(ACTION_STATUS, if (speechReady) "listening" else "starting")
             }
             else -> return START_NOT_STICKY
         }
@@ -137,6 +140,7 @@ class VoiceKeepAliveService : Service() {
                     override fun onReadyForSpeech(params: Bundle?) {
                         if (!isCurrent(currentGeneration)) return
                         retryCount = 0
+                        speechReady = true
                         publish(ACTION_STATUS, "listening")
                     }
                     override fun onBeginningOfSpeech() {}
@@ -145,17 +149,19 @@ class VoiceKeepAliveService : Service() {
                     }
                     override fun onBufferReceived(buffer: ByteArray?) {}
                     override fun onEndOfSpeech() {
-                        if (isCurrent(currentGeneration)) publish(ACTION_STATUS, "endOfSpeech")
+                        if (isCurrent(currentGeneration)) { speechReady = false; publish(ACTION_STATUS, "endOfSpeech") }
                     }
                     override fun onError(error: Int) {
                         if (!isCurrent(currentGeneration)) return
                         Log.w(TAG, "SpeechRecognizer error=$error")
+                        speechReady = false
                         publishError("Speech recognizer error: $error", false)
                         releaseRecognizer()
                         if (running) scheduleRecognition(retryDelay(error))
                     }
                     override fun onResults(results: Bundle?) {
                         if (!isCurrent(currentGeneration)) return
+                        speechReady = false
                         val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) ?: arrayListOf()
                         val best = matches.firstOrNull { containsWakeWord(it) } ?: matches.firstOrNull().orEmpty()
                         if (best.isNotBlank()) publishResult(best, true, matches)
@@ -212,6 +218,8 @@ class VoiceKeepAliveService : Service() {
 
     private fun stopRecognition() {
         running = false
+        isRunning = false
+        speechReady = false
         retryRunnable?.let { handler.removeCallbacks(it) }
         retryRunnable = null
         releaseRecognizer()
@@ -257,6 +265,8 @@ class VoiceKeepAliveService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     companion object {
+        @Volatile var isRunning: Boolean = false
+            private set
         const val ACTION_START = "com.privateagent.private_agent.action.START_VOICE_SESSION"
         const val ACTION_STOP = "com.privateagent.private_agent.action.STOP_VOICE_SESSION"
         const val ACTION_STATUS = "com.privateagent.private_agent.action.VOICE_STATUS"
