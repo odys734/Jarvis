@@ -129,7 +129,8 @@ class VoiceKeepAliveService : Service() {
     private fun startRecognition() {
         if (!running) return
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            publish(ACTION_ERROR, "Speech recognition service is unavailable", true)
+            publish(ACTION_ERROR, "Speech recognition service is unavailable; retrying", false)
+            scheduleRecognition(30_000L)
             return
         }
         try {
