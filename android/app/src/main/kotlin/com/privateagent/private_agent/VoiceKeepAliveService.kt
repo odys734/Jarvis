@@ -157,7 +157,7 @@ class VoiceKeepAliveService : Service() {
                     override fun onResults(results: Bundle?) {
                         if (!isCurrent(currentGeneration)) return
                         val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) ?: arrayListOf()
-                        val best = matches.firstOrNull().orEmpty()
+                        val best = matches.firstOrNull { containsWakeWord(it) } ?: matches.firstOrNull().orEmpty()
                         if (best.isNotBlank()) publishResult(best, true, matches)
                         releaseRecognizer()
                         if (running) scheduleRecognition(250L)
@@ -228,6 +228,11 @@ class VoiceKeepAliveService : Service() {
 
     private fun publishLevel(level: Float) {
         sendBroadcast(Intent(ACTION_LEVEL).setPackage(packageName).putExtra(EXTRA_LEVEL, level.toDouble()))
+    }
+
+    private fun containsWakeWord(text: String): Boolean {
+        val value = text.lowercase(Locale.ROOT)
+        return listOf("jarvis", "javis", "jervis", "jarves", "jarvice", "charvis", "travis", "service", "davis", "davies", "harvest", "jarvi", "google", "j.a.r.v.i.s").any { value.contains(it) }
     }
 
     private fun publishResult(text: String, isFinal: Boolean, candidates: ArrayList<String>) {
