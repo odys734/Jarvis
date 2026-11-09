@@ -146,7 +146,19 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
-        stopNativeListening()
+        // A continuous session is explicitly user-started and protected by
+        // VoiceKeepAliveService. Do not tear its recognizer down merely because
+        // the Flutter Activity is being recreated or removed from the UI.
+        // Explicit Stop still calls stopNativeListening() through the channel.
+        if (!isContinuousListening || manualListeningActive) {
+            stopNativeListening()
+        } else {
+            cancelReadyWatchdog()
+            android.util.Log.i(
+                "JARVIS_VOICE",
+                "Activity destroyed while continuous voice session is active; preserving session",
+            )
+        }
         try {
             audioPlaybackCallback?.let { callback ->
                 val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
