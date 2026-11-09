@@ -97,6 +97,7 @@ class MainActivity : FlutterActivity() {
     private var playResult: MethodChannel.Result? = null
 
     private val cameraRequestCode = 9102
+    private val systemSttRequestCode = 9103
     private var pendingCameraResult: MethodChannel.Result? = null
     private var currentPhotoPath: String? = null
 
@@ -118,6 +119,16 @@ class MainActivity : FlutterActivity() {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == systemSttRequestCode) {
+            if (resultCode == RESULT_OK) {
+                val matches = data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS) ?: arrayListOf()
+                val best = matches.firstOrNull().orEmpty()
+                speechChannel?.invokeMethod("onSystemSttResult", mapOf("text" to best, "candidates" to matches))
+            } else {
+                speechChannel?.invokeMethod("onSystemSttCancelled", null)
+            }
+            return
+        }
         if (requestCode == cameraRequestCode) {
             val result = pendingCameraResult
             pendingCameraResult = null
@@ -1258,6 +1269,26 @@ class MainActivity : FlutterActivity() {
         speechChannel = sChannel
         sChannel.setMethodCallHandler { call, result ->
             when (call.method) {
+                "startSystemStt" -> {
+                    try {
+                        val language = call.argument<String>("language") ?: Locale.getDefault().toLanguageTag()
+                        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                            putExtra(RecognizerIntent.EXTRA_LANGUAGE, language)
+                            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, language)
+                            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
+                            putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak to JARVIS")
+                        }
+                        if (intent.resolveActivity(packageManager) == null) {
+                            result.success(mapOf("accepted" to false, "reason" to "unavailable"))
+                        } else {
+                            startActivityForResult(intent, systemSttRequestCode)
+                            result.success(mapOf("accepted" to true))
+                        }
+                    } catch (e: Exception) {
+                        result.success(mapOf("accepted" to false, "reason" to (e.message ?: "system_stt_failed")))
+                    }
+                }
                 "startListening" -> {
                     val continuous = call.argument<Boolean>("continuous") ?: true
                     val manual = call.argument<Boolean>("manual") ?: false
