@@ -145,7 +145,68 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+
+    private val voiceServiceReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                VoiceKeepAliveService.ACTION_STATUS -> {
+                    speechChannel?.invokeMethod("onSpeechStatus", intent.getStringExtra(VoiceKeepAliveService.EXTRA_VALUE) ?: "unknown")
+                }
+                VoiceKeepAliveService.ACTION_RESULT -> {
+                    speechChannel?.invokeMethod(
+                        "onSpeechResult",
+                        mapOf(
+                            "text" to (intent.getStringExtra(VoiceKeepAliveService.EXTRA_TEXT) ?: ""),
+                            "isFinal" to intent.getBooleanExtra(VoiceKeepAliveService.EXTRA_FINAL, false),
+                            "candidates" to (intent.getStringArrayListExtra(VoiceKeepAliveService.EXTRA_CANDIDATES) ?: arrayListOf<String>()),
+                        ),
+                    )
+                }
+                VoiceKeepAliveService.ACTION_ERROR -> {
+                    speechChannel?.invokeMethod(
+                        "onSpeechError",
+                        mapOf(
+                            "code" to -1,
+                            "message" to (intent.getStringExtra(VoiceKeepAliveService.EXTRA_VALUE) ?: "Voice service error"),
+                            "fatal" to intent.getBooleanExtra(VoiceKeepAliveService.EXTRA_FATAL, false),
+                        ),
+                    )
+                }
+                VoiceKeepAliveService.ACTION_LEVEL -> {
+                    speechChannel?.invokeMethod("onSoundLevel", intent.getDoubleExtra(VoiceKeepAliveService.EXTRA_LEVEL, 0.0))
+                }
+            }
+        }
+    }
+
+    private var voiceReceiverRegistered = false
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val filter = IntentFilter().apply {
+            addAction(VoiceKeepAliveService.ACTION_STATUS)
+            addAction(VoiceKeepAliveService.ACTION_RESULT)
+            addAction(VoiceKeepAliveService.ACTION_ERROR)
+            addAction(VoiceKeepAliveService.ACTION_LEVEL)
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(voiceServiceReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                @Suppress("DEPRECATION")
+                registerReceiver(voiceServiceReceiver, filter)
+            }
+            voiceReceiverRegistered = true
+        } catch (e: Exception) {
+            android.util.Log.e("JARVIS_VOICE", "Could not register voice service receiver: ${e.message}")
+        }
+    }
+
     override fun onDestroy() {
+        if (voiceReceiverRegistered) {
+            try { unregisterReceiver(voiceServiceReceiver) } catch (_: Exception) {}
+            voiceReceiverRegistered = false
+        }
         // A continuous session is explicitly user-started and protected by
         // VoiceKeepAliveService. Do not tear its recognizer down merely because
         // the Flutter Activity is being recreated or removed from the UI.
@@ -983,6 +1044,30 @@ class MainActivity : FlutterActivity() {
             return mapOf("accepted" to false, "deferred" to false, "reason" to "permissionDenied")
         }
 
+        if (continuous && !manual) {
+            // Continuous recognition belongs to the foreground service, not this Activity.
+            mainHandler.removeCallbacks(restartRunnable)
+            isRestartPending = false
+            destroyRecognizer()
+            manualListeningActive = false
+            isContinuousListening = true
+            val serviceIntent = Intent(this, VoiceKeepAliveService::class.java).apply {
+                action = VoiceKeepAliveService.ACTION_START
+                if (!languageTag.isNullOrBlank()) putExtra(VoiceKeepAliveService.EXTRA_LANGUAGE, languageTag)
+            }
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(serviceIntent)
+                else startService(serviceIntent)
+                emitStatus("starting")
+                return mapOf("accepted" to true, "deferred" to false, "serviceOwned" to true)
+            } catch (e: Exception) {
+                isContinuousListening = false
+                emitSpeechError(-4, "Could not start background listening service: ${e.message}", false)
+                emitStatus("notListening")
+                return mapOf("accepted" to false, "deferred" to false, "reason" to "serviceStartFailed")
+            }
+        }
+
         if (manual) {
             // Explicit user/assistant action may temporarily override media
             // suppression. One-shot recognition does not take over continuous mode.
@@ -1036,6 +1121,13 @@ class MainActivity : FlutterActivity() {
         isRestartPending = false
         mainHandler.removeCallbacks(restartRunnable)
         destroyRecognizer()
+        try {
+            startService(Intent(this, VoiceKeepAliveService::class.java).apply {
+                action = VoiceKeepAliveService.ACTION_STOP
+            })
+        } catch (_: Exception) {
+            stopService(Intent(this, VoiceKeepAliveService::class.java))
+        }
         stopVoiceKeepAlive()
         emitStatus("notListening")
     }
