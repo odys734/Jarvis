@@ -715,7 +715,17 @@ class MainActivity : FlutterActivity() {
         if (resumeContinuousAfterManual && resumeContinuous) {
             resumeContinuousAfterManual = false
             isContinuousListening = true
-            scheduleRestart(200L)
+            val serviceIntent = Intent(this, VoiceKeepAliveService::class.java).apply {
+                action = VoiceKeepAliveService.ACTION_START
+                languageTagOverride?.let { putExtra(VoiceKeepAliveService.EXTRA_LANGUAGE, it) }
+            }
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(serviceIntent)
+                else startService(serviceIntent)
+            } catch (e: Exception) {
+                emitSpeechError(-4, "Could not resume background listening: ${e.message}", false)
+                emitStatus("notListening")
+            }
         } else {
             resumeContinuousAfterManual = false
             if (isContinuousListening) {
@@ -1069,10 +1079,13 @@ class MainActivity : FlutterActivity() {
         }
 
         if (manual) {
-            // Explicit user/assistant action may temporarily override media
-            // suppression. One-shot recognition does not take over continuous mode.
+            // Pause the service-owned continuous recognizer before opening a one-shot
+            // recognizer, otherwise Android reports a busy microphone recognizer.
             mediaSuppressionUntil = 0L
             resumeContinuousAfterManual = isContinuousListening
+            if (isContinuousListening) {
+                try { stopService(Intent(this, VoiceKeepAliveService::class.java)) } catch (_: Exception) {}
+            }
             manualListeningActive = true
             isContinuousListening = false
         } else {
