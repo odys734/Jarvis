@@ -211,7 +211,7 @@ class MainActivity : FlutterActivity() {
         // VoiceKeepAliveService. Do not tear its recognizer down merely because
         // the Flutter Activity is being recreated or removed from the UI.
         // Explicit Stop still calls stopNativeListening() through the channel.
-        if (!isContinuousListening || manualListeningActive) {
+        if ((!isContinuousListening && !VoiceKeepAliveService.isRunning) || manualListeningActive) {
             stopNativeListening()
         } else {
             cancelReadyWatchdog()
@@ -1082,8 +1082,8 @@ class MainActivity : FlutterActivity() {
             // Pause the service-owned continuous recognizer before opening a one-shot
             // recognizer, otherwise Android reports a busy microphone recognizer.
             mediaSuppressionUntil = 0L
-            resumeContinuousAfterManual = isContinuousListening
-            if (isContinuousListening) {
+            resumeContinuousAfterManual = isContinuousListening || VoiceKeepAliveService.isRunning
+            if (resumeContinuousAfterManual) {
                 try { stopService(Intent(this, VoiceKeepAliveService::class.java)) } catch (_: Exception) {}
             }
             manualListeningActive = true
