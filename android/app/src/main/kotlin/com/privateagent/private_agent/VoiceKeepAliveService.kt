@@ -35,6 +35,15 @@ class VoiceKeepAliveService : Service() {
     private var languageTag: String? = null
     private var retryCount = 0
     private var retryRunnable: Runnable? = null
+    private var readyWatchdog: Runnable? = null
+    private var resultsWatchdog: Runnable? = null
+
+    private fun cancelRecognitionWatchdogs() {
+        readyWatchdog?.let { handler.removeCallbacks(it) }
+        resultsWatchdog?.let { handler.removeCallbacks(it) }
+        readyWatchdog = null
+        resultsWatchdog = null
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -142,20 +151,39 @@ class VoiceKeepAliveService : Service() {
                         if (!isCurrent(currentGeneration)) return
                         retryCount = 0
                         speechReady = true
+                        readyWatchdog?.let { handler.removeCallbacks(it) }
+                        readyWatchdog = null
                         publish(ACTION_STATUS, "listening")
                     }
-                    override fun onBeginningOfSpeech() {}
+                    override fun onBeginningOfSpeech() {
+                        if (!isCurrent(currentGeneration)) return
+                        speechReady = true
+                        readyWatchdog?.let { handler.removeCallbacks(it) }
+                        readyWatchdog = null
+                    }
                     override fun onRmsChanged(rmsdB: Float) {
                         if (isCurrent(currentGeneration)) publishLevel(rmsdB)
                     }
                     override fun onBufferReceived(buffer: ByteArray?) {}
                     override fun onEndOfSpeech() {
-                        if (isCurrent(currentGeneration)) { speechReady = false; publish(ACTION_STATUS, "endOfSpeech") }
+                        if (!isCurrent(currentGeneration)) return
+                        speechReady = false
+                        publish(ACTION_STATUS, "endOfSpeech")
+                        resultsWatchdog?.let { handler.removeCallbacks(it) }
+                        val task = Runnable {
+                            if (!isCurrent(currentGeneration)) return@Runnable
+                            Log.w(TAG, "No final speech result received; recreating recognizer")
+                            releaseRecognizer()
+                            if (running) scheduleRecognition(250L)
+                        }
+                        resultsWatchdog = task
+                        handler.postDelayed(task, 5_000L)
                     }
                     override fun onError(error: Int) {
                         if (!isCurrent(currentGeneration)) return
                         Log.w(TAG, "SpeechRecognizer error=$error")
                         speechReady = false
+                        cancelRecognitionWatchdogs()
                         publishError("Speech recognizer error: $error", false)
                         releaseRecognizer()
                         if (running) scheduleRecognition(retryDelay(error))
@@ -163,6 +191,7 @@ class VoiceKeepAliveService : Service() {
                     override fun onResults(results: Bundle?) {
                         if (!isCurrent(currentGeneration)) return
                         speechReady = false
+                        cancelRecognitionWatchdogs()
                         val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) ?: arrayListOf()
                         val best = matches.firstOrNull { containsWakeWord(it) } ?: matches.firstOrNull().orEmpty()
                         if (best.isNotBlank()) publishResult(best, true, matches)
@@ -188,6 +217,15 @@ class VoiceKeepAliveService : Service() {
                 putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
             }
             publish(ACTION_STATUS, "starting")
+            val watchdog = Runnable {
+                if (!isCurrent(currentGeneration) || speechReady) return@Runnable
+                Log.w(TAG, "Speech recognizer did not become ready; restarting")
+                publishError("Speech engine did not become ready; retrying", false)
+                releaseRecognizer()
+                if (running) scheduleRecognition(retryDelay(SpeechRecognizer.ERROR_CLIENT))
+            }
+            readyWatchdog = watchdog
+            handler.postDelayed(watchdog, 8_000L)
             recognizer?.startListening(speechIntent)
         } catch (e: Exception) {
             Log.e(TAG, "Could not start recognition", e)
@@ -211,6 +249,7 @@ class VoiceKeepAliveService : Service() {
     }
 
     private fun releaseRecognizer() {
+        cancelRecognitionWatchdogs()
         generation++
         try { recognizer?.cancel() } catch (_: Exception) {}
         try { recognizer?.destroy() } catch (_: Exception) {}
@@ -241,7 +280,9 @@ class VoiceKeepAliveService : Service() {
 
     private fun containsWakeWord(text: String): Boolean {
         val value = text.lowercase(Locale.ROOT)
-        return listOf("jarvis", "javis", "jervis", "jarves", "jarvice", "charvis", "travis", "service", "davis", "davies", "harvest", "jarvi", "google", "j.a.r.v.i.s").any { value.contains(it) }
+            .replace(Regex("[^a-z]"), "")
+        // Avoid common-word false positives (for example "service" or "Google").
+        return listOf("jarvis", "javis", "jervis", "jarves", "jarvice", "charvis", "jarvi", "j a r v i s".filter { it.isLetter() }).any { value.contains(it) }
     }
 
     private fun publishResult(text: String, isFinal: Boolean, candidates: ArrayList<String>) {
