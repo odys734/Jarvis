@@ -99,6 +99,13 @@
                 android:value="Shows the PrivateAgent floating control bubble and transcript panel on top of other apps while the agent performs UI automation." />
         </service>
 
+        <!-- User-started, visible foreground service for background voice sessions -->
+        <service
+            android:name=".VoiceKeepAliveService"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:foregroundServiceType="microphone" />
+
         <!-- Notification Listener for live email & SMS inbox triage -->
         <service
             android:name=".InboxNotificationListenerService"
