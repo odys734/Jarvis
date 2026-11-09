@@ -379,6 +379,13 @@ class _JarvisSettingsScreenState extends State<JarvisSettingsScreen> {
               },
             ),
             const Divider(height: 24),
+            const Text('Speech Recognition Engine', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 4),
+            Text('Choose the microphone engine. Android System STT opens the system speech screen for tap-to-talk; it is not an always-on wake-word engine.', style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.onSurfaceVariant)),
+            const SizedBox(height: 8),
+            RadioListTile<String>(contentPadding: EdgeInsets.zero, dense: true, title: const Text('JARVIS Continuous Engine'), subtitle: const Text('Hands-free background listening'), value: 'continuous', groupValue: _settings.speechEngine, onChanged: (v) async { if (v != null) { await _settings.setSpeechEngine(v); setState(() {}); } }),
+            RadioListTile<String>(contentPadding: EdgeInsets.zero, dense: true, title: const Text('Android System STT (Fallback)'), subtitle: const Text('Tap-to-speak using Android speech recognition UI'), value: 'system', groupValue: _settings.speechEngine, onChanged: (v) async { if (v != null) { await _settings.setSpeechEngine(v); setState(() {}); } }),
+            const Divider(height: 24),
 
             // Ultra-Realistic Neural Voice Toggle & Selector
             SwitchListTile(
