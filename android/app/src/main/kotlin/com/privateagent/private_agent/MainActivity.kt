@@ -692,6 +692,7 @@ class MainActivity : FlutterActivity() {
 
         if (fatal) {
             isContinuousListening = false
+            stopVoiceKeepAlive()
             destroyRecognizer()
             emitStatus("notListening")
             return
@@ -912,6 +913,29 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    private fun startVoiceKeepAlive() {
+        try {
+            val intent = Intent(this, VoiceKeepAliveService::class.java).apply {
+                action = VoiceKeepAliveService.ACTION_START
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent)
+            } else {
+                startService(intent)
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("JARVIS_VOICE", "Could not start voice foreground service: ${e.message}")
+            emitSpeechError(-4, "Background voice service could not start: ${e.message}", false)
+        }
+    }
+
+    private fun stopVoiceKeepAlive() {
+        try {
+            stopService(Intent(this, VoiceKeepAliveService::class.java))
+        } catch (_: Exception) {
+        }
+    }
+
     private fun startNativeListening(
         continuous: Boolean,
         manual: Boolean = false,
@@ -975,6 +999,12 @@ class MainActivity : FlutterActivity() {
             isContinuousListening = continuous
         }
 
+        // A visible foreground service and partial wake lock keep the
+        // user-started continuous session alive while the screen is off.
+        if (continuous && !manual) {
+            startVoiceKeepAlive()
+        }
+
         if (continuous && speechRecognizer != null && isSpeechReady && !isRestartPending) {
             android.util.Log.i("JARVIS_VOICE", "Continuous recognizer already active")
             return mapOf("accepted" to true, "deferred" to false, "alreadyListening" to true)
@@ -994,6 +1024,7 @@ class MainActivity : FlutterActivity() {
         isRestartPending = false
         mainHandler.removeCallbacks(restartRunnable)
         destroyRecognizer()
+        stopVoiceKeepAlive()
         emitStatus("notListening")
     }
 
