@@ -165,7 +165,7 @@ class VoiceKeepAliveService : Service() {
                     override fun onPartialResults(results: Bundle?) {
                         if (!isCurrent(currentGeneration)) return
                         val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) ?: arrayListOf()
-                        val best = matches.firstOrNull().orEmpty()
+                        val best = matches.firstOrNull { containsWakeWord(it) } ?: matches.firstOrNull().orEmpty()
                         if (best.isNotBlank()) publishResult(best, false, matches)
                     }
                     override fun onEvent(eventType: Int, params: Bundle?) {}
