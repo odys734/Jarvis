@@ -68,9 +68,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         JarvisService.instance.speakGreeting();
       });
     }
-    if (SettingsService.instance.jarvisAlwaysOn) {
-      JarvisService.instance.ensureAlwaysOnRunning();
-    }
+    // Defer the initial microphone request until the first frame is visible.
+    // This ensures Android can present the runtime RECORD_AUDIO permission
+    // prompt from a foreground Activity instead of during app initialization.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (SettingsService.instance.jarvisAlwaysOn) {
+        JarvisService.instance.ensureAlwaysOnRunning();
+      }
+    });
     _voice.listeningNotifier.addListener(_onVoiceListeningChanged);
     ProactiveAgentService.instance.addListener(_onProactiveUpdate);
     ProactiveAgentService.instance.evaluateProactiveNeeds();
