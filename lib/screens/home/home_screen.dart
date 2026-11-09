@@ -62,18 +62,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
     };
 
-    if (_mode == AppMode.jarvis) {
-      JarvisService.instance.onEnterJarvisMode();
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        JarvisService.instance.speakGreeting();
-      });
-    }
-    // Defer the initial microphone request until the first frame is visible.
-    // This ensures Android can present the runtime RECORD_AUDIO permission
-    // prompt from a foreground Activity instead of during app initialization.
+    // Start the microphone exactly once, after the first frame is visible.
+    // Previously onEnterJarvisMode(), JarvisService._initListeners(), and this
+    // post-frame callback could all request SpeechRecognizer concurrently.
+    // That race can leave Android's recognizer busy and JARVIS apparently deaf.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      if (SettingsService.instance.jarvisAlwaysOn) {
+      if (_mode == AppMode.jarvis) {
+        JarvisService.instance.onEnterJarvisMode();
+        JarvisService.instance.speakGreeting();
+      } else if (SettingsService.instance.jarvisAlwaysOn) {
         JarvisService.instance.ensureAlwaysOnRunning();
       }
     });
